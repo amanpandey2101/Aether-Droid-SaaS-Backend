@@ -1,0 +1,214 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Android Screen Stream</title>
+  <style>
+    * {
+      margin: 0;
+      padding: 0;
+      box-sizing: border-box;
+    }
+    body {
+      min-height: 100vh;
+      background: linear-gradient(135deg, #1a1a2e 0%, #16213e 50%, #0f3460 100%);
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      justify-content: center;
+      font-family: 'Segoe UI', system-ui, sans-serif;
+      color: #e0e0e0;
+      padding: 20px;
+    }
+    h1 {
+      margin-bottom: 20px;
+      font-weight: 300;
+      letter-spacing: 2px;
+      color: #00d4ff;
+      text-shadow: 0 0 20px rgba(0, 212, 255, 0.3);
+    }
+    .container {
+      background: rgba(255, 255, 255, 0.05);
+      border-radius: 20px;
+      padding: 20px;
+      backdrop-filter: blur(10px);
+      border: 1px solid rgba(255, 255, 255, 0.1);
+      box-shadow: 0 8px 32px rgba(0, 0, 0, 0.3);
+    }
+    #video {
+      width: 360px;
+      height: 640px;
+      border-radius: 12px;
+      background: #000;
+      object-fit: contain;
+    }
+    .status {
+      margin-top: 15px;
+      padding: 10px 20px;
+      border-radius: 8px;
+      font-size: 14px;
+      text-align: center;
+    }
+    .status.connecting {
+      background: rgba(255, 193, 7, 0.2);
+      color: #ffc107;
+    }
+    .status.connected {
+      background: rgba(76, 175, 80, 0.2);
+      color: #4caf50;
+    }
+    .status.error {
+      background: rgba(244, 67, 54, 0.2);
+      color: #f44336;
+    }
+    .info {
+      margin-top: 10px;
+      font-size: 12px;
+      color: #888;
+    }
+  </style>
+</head>
+<body>
+
+<h1>📱 Android Stream</h1>
+
+<div class="container">
+  <video id="video" autoplay playsinline muted></video>
+  <div id="status" class="status connecting">Connecting...</div>
+  <div id="info" class="info"></div>
+</div>
+
+<script>
+const statusEl = document.getElementById('status');
+const infoEl = document.getElementById('info');
+const videoEl = document.getElementById('video');
+
+function setStatus(text, type) {
+  statusEl.textContent = text;
+  statusEl.className = 'status ' + type;
+}
+
+function setInfo(text) {
+  infoEl.textContent = text;
+}
+
+async function start() {
+  try {
+    setStatus('Creating WebRTC connection...', 'connecting');
+
+    const pc = new RTCPeerConnection({
+      iceServers: [{ urls: "stun:stun.l.google.com:19302" }]
+    });
+
+    // Add video transceiver to receive video
+    pc.addTransceiver("video", { direction: "recvonly" });
+
+    // Handle incoming track
+    pc.ontrack = (event) => {
+      console.log('Track received:', event.track.kind);
+      setStatus('Video track received', 'connected');
+      
+      if (event.streams && event.streams[0]) {
+        videoEl.srcObject = event.streams[0];
+        console.log('Stream attached to video element');
+      }
+    };
+
+    // Monitor connection state
+    pc.onconnectionstatechange = () => {
+      console.log('Connection state:', pc.connectionState);
+      setInfo('Connection: ' + pc.connectionState);
+      
+      if (pc.connectionState === 'connected') {
+        setStatus('Connected & Streaming', 'connected');
+      } else if (pc.connectionState === 'failed' || pc.connectionState === 'disconnected') {
+        setStatus('Connection ' + pc.connectionState, 'error');
+      }
+    };
+
+    pc.oniceconnectionstatechange = () => {
+      console.log('ICE state:', pc.iceConnectionState);
+    };
+
+    // Create offer
+    const offer = await pc.createOffer({ offerToReceiveVideo: true });
+    await pc.setLocalDescription(offer);
+    console.log('Local description set');
+
+    // Wait for ICE gathering to complete
+    setStatus('Gathering ICE candidates...', 'connecting');
+    await new Promise((resolve, reject) => {
+      const timeout = setTimeout(() => {
+        console.log('ICE gathering timeout, proceeding anyway');
+        resolve();
+      }, 5000);
+
+      if (pc.iceGatheringState === "complete") {
+        clearTimeout(timeout);
+        resolve();
+      } else {
+        pc.addEventListener("icegatheringstatechange", () => {
+          if (pc.iceGatheringState === "complete") {
+            clearTimeout(timeout);
+            resolve();
+          }
+        });
+      }
+    });
+
+    console.log('ICE gathering complete');
+    setStatus('Sending offer to server...', 'connecting');
+
+    // Send offer to server (use relative URL or current host)
+    const serverUrl = window.location.hostname === 'localhost' || window.location.hostname === '127.0.0.1'
+      ? 'http://localhost:8080/offer'
+      : `http://${window.location.hostname}:8080/offer`;
+
+    console.log('Sending offer to:', serverUrl);
+
+    const res = await fetch(serverUrl, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(pc.localDescription)
+    });
+
+    if (!res.ok) {
+      throw new Error(`Server returned ${res.status}: ${await res.text()}`);
+    }
+
+    const answer = await res.json();
+    console.log('Received answer from server');
+
+    await pc.setRemoteDescription(answer);
+    console.log('Remote description set');
+
+    setStatus('Waiting for video stream...', 'connecting');
+
+  } catch (err) {
+    console.error('WebRTC error:', err);
+    setStatus('Error: ' + err.message, 'error');
+  }
+}
+
+// Auto-start on load
+start();
+
+// Handle video element events
+videoEl.onloadedmetadata = () => {
+  console.log('Video metadata loaded:', videoEl.videoWidth, 'x', videoEl.videoHeight);
+  setInfo(`Resolution: ${videoEl.videoWidth}x${videoEl.videoHeight}`);
+};
+
+videoEl.onplaying = () => {
+  console.log('Video is playing');
+  setStatus('✅ Streaming', 'connected');
+};
+
+videoEl.onerror = (e) => {
+  console.error('Video error:', e);
+};
+</script>
+
+</body>
+</html>
