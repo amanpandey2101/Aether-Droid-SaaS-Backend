@@ -2,16 +2,21 @@ package main
 
 import (
 	"encoding/json"
-	"io"
+	"image"
 	"log"
 	"net/http"
 	"os"
+	"strconv"
+	"strings"
 	"sync"
 	"time"
 
+	"android_cloud_backend/internal/api"
+	"android_cloud_backend/internal/config"
+	"android_cloud_backend/internal/container"
+	"android_cloud_backend/internal/database"
 	"android_cloud_backend/internal/emulator"
-
-	"github.com/pion/webrtc/v3"
+	pb "android_cloud_backend/internal/emulator/proto"
 )
 
 var (
@@ -19,233 +24,333 @@ var (
 	emuClient   *emulator.EmulatorClient
 	h264Enc     *emulator.H264Encoder
 	mu          sync.Mutex
+	cfg         *config.Config
 )
 
 func main() {
-	log.Println("Starting WebRTC Android Stream Server on :8080")
+	// Load configuration
+	cfg = config.Load()
+	log.Println("🚀 Starting Aether Android Cloud Backend")
+
+	// Initialize database service
+	dbService, err := database.NewService()
+	if err != nil {
+		log.Printf("⚠️  Database service not available: %v", err)
+		log.Println("💾 Database operations will be disabled")
+		dbService = nil
+	}
+
+	// Initialize container manager
+	containerManager, err := container.NewManager(cfg, dbService)
+	if err != nil {
+		log.Printf("⚠️  Container manager not available: %v", err)
+		log.Println("📦 Container management will return errors, but API routes are available")
+		containerManager = nil
+	}
+
+	// Create API router (always available, even if services are not)
+	apiRouter := api.NewRouter(containerManager, cfg)
+	if containerManager != nil && dbService != nil {
+		log.Println("✅ Container management API with database enabled")
+	} else {
+		log.Println("⚠️  Container management API mounted but some services unavailable")
+	}
 
 	// Get emulator address from environment or use default
-	// Format: "host:port" (e.g., "34.132.33.72:8554" for gRPC emulator controller)
-	// Note: Port 8554 is the standard gRPC emulator controller port
-	// Port 5555 is typically used for ADB, not gRPC
 	emulatorAddr := os.Getenv("EMULATOR_ADDR")
 	if emulatorAddr == "" {
-		emulatorAddr = "34.41.82.116:8554"
+		emulatorAddr = "localhost:8554"
 	}
-	log.Printf("Connecting to emulator at: %s", emulatorAddr)
+	log.Printf("📱 Emulator address: %s", emulatorAddr)
 
-	// Initialize emulator client early
-	var err error
+	// Try to connect to emulator (optional - may not be running)
 	emuClient, err = emulator.NewEmulatorClient(emulatorAddr)
 	if err != nil {
-		log.Fatalf("Failed to connect to emulator: %v", err)
+		log.Printf("⚠️  Emulator not connected: %v", err)
+		log.Println("📺 WebRTC streaming will be available when emulator connects")
+	} else {
+		log.Printf("✅ Connected to emulator gRPC at %s", emulatorAddr)
 	}
-	log.Printf("Connected to emulator gRPC at %s", emulatorAddr)
 
-	// WebRTC endpoint
-	http.HandleFunc("/offer", func(w http.ResponseWriter, r *http.Request) {
+	// Create HTTP mux
+	mux := http.NewServeMux()
 
-		w.Header().Set("Access-Control-Allow-Origin", "*")
-		w.Header().Set("Access-Control-Allow-Methods", "POST, OPTIONS")
-		w.Header().Set("Access-Control-Allow-Headers", "Content-Type")
-		w.Header().Set("Access-Control-Max-Age", "86400")
+	// Mount API routes if container manager is available
+	if apiRouter != nil {
+		mux.HandleFunc("/api/", func(w http.ResponseWriter, r *http.Request) {
+			apiRouter.ServeHTTP(w, r)
+		})
+		// Handle offer routes through API router with JWT authentication
+		mux.HandleFunc("/offer", api.ChainMiddleware(
+			http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				apiRouter.ServeHTTP(w, r)
+			}),
+			api.JWTMiddleware,
+		).ServeHTTP)
+		mux.HandleFunc("/offer/", api.ChainMiddleware(
+			http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				apiRouter.ServeHTTP(w, r)
+			}),
+			api.JWTMiddleware,
+		).ServeHTTP)
+	}
 
-
-		if r.Method == http.MethodOptions {
-			log.Println("⚠️  CORS Preflight request accepted")
-			w.WriteHeader(http.StatusOK)
-			return
-		}
-
-		// Handle the real POST request
-		handleOffer(w, r)
+	// Health check
+	mux.HandleFunc("/health", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(map[string]string{
+			"status":  "healthy",
+			"version": "1.0.0",
+		})
 	})
 
 	// Start frame loop in background
 	go startFrameLoop()
 
-	log.Fatal(http.ListenAndServe(":8080", nil))
+	// Apply middleware
+	handler := api.ChainMiddleware(
+		mux,
+		api.RecoveryMiddleware,
+		api.LoggingMiddleware,
+		api.CORSMiddleware(cfg.Server.AllowedOrigins),
+	)
+
+	serverAddr := ":" + cfg.Server.Port
+	log.Printf("🌐 Server listening on %s", serverAddr)
+	log.Println("📖 API Endpoints:")
+	log.Println("   GET  /health              - Health check")
+	log.Println("   GET  /api/health          - API health check")
+	log.Println("   GET  /api/images          - List available emulator images")
+	log.Println("   GET  /api/containers      - List containers")
+	log.Println("   POST /api/containers      - Create container")
+	log.Println("   GET  /api/containers/{id} - Get container details")
+	log.Println("   POST /api/containers/{id}/stop   - Stop container")
+	log.Println("   DELETE /api/containers/{id}      - Delete container")
+	log.Println("   GET  /api/containers/{id}/connect - Get connection info")
+	log.Println("   POST /offer               - WebRTC offer (default emulator)")
+	log.Println("   POST /offer/{container_id} - WebRTC offer (specific container)")
+
+	log.Fatal(http.ListenAndServe(serverAddr, handler))
 }
 
-func handleOffer(w http.ResponseWriter, r *http.Request) {
-	log.Println("=== /offer called ===")
-
-	// Read raw request for debugging
-	raw, _ := io.ReadAll(r.Body)
-	log.Println("Raw Offer JSON length:", len(raw))
-
-	// Decode offer
-	var offer webrtc.SessionDescription
-	log.Println("r.ContentLength:", r.ContentLength)
-	log.Println("r.Method:", r.Method)
-
-	if err := json.Unmarshal(raw, &offer); err != nil {
-		log.Println("JSON Unmarshal error:", err)
-		http.Error(w, err.Error(), 400)
+func handleInputCommand(cmd string) {
+	if emuClient == nil {
+		log.Printf("❌ No emulator client for input: %s", cmd)
 		return
 	}
 
-	log.Println("Offer Type:", offer.Type)
-	log.Println("Offer SDP length:", len(offer.SDP))
-	if len(offer.SDP) < 10 {
-		log.Println("Offer SDP is empty or invalid")
-		http.Error(w, "Invalid SDP", 400)
+	parts := strings.Split(cmd, ":")
+	if len(parts) < 2 {
 		return
 	}
 
-	// Create PeerConnection with H.264 codec preference
-	mediaEngine := &webrtc.MediaEngine{}
-	if err := mediaEngine.RegisterCodec(webrtc.RTPCodecParameters{
-		RTPCodecCapability: webrtc.RTPCodecCapability{
-			MimeType:    webrtc.MimeTypeH264,
-			ClockRate:   90000,
-			SDPFmtpLine: "level-asymmetry-allowed=1;packetization-mode=1;profile-level-id=42e01f",
-		},
-		PayloadType: 96,
-	}, webrtc.RTPCodecTypeVideo); err != nil {
-		log.Println("RegisterCodec error:", err)
-		http.Error(w, err.Error(), 500)
-		return
+	cmdType := parts[0]
+	args := parts[1:]
+
+	switch cmdType {
+	case "touch":
+		if len(args) >= 2 {
+			x, errX := strconv.Atoi(args[0])
+			y, errY := strconv.Atoi(args[1])
+			if errX == nil && errY == nil {
+				touchEvent := &pb.TouchEvent{
+					Touches: []*pb.Touch{{
+						X: int32(x), Y: int32(y),
+						Pressure: 50, TouchMajor: 10, TouchMinor: 10,
+					}},
+				}
+				emuClient.SendTouch(touchEvent)
+			}
+		}
+	case "swipe":
+		if len(args) >= 5 {
+			startX, _ := strconv.Atoi(args[0])
+			startY, _ := strconv.Atoi(args[1])
+			endX, _ := strconv.Atoi(args[2])
+			endY, _ := strconv.Atoi(args[3])
+			duration, _ := strconv.Atoi(args[4])
+
+			if duration > 0 {
+				steps := 12
+				stepDuration := duration / steps
+
+				// Touch down
+				emuClient.SendTouch(&pb.TouchEvent{
+					Touches: []*pb.Touch{{
+						X: int32(startX), Y: int32(startY),
+						Pressure: 80, TouchMajor: 15, TouchMinor: 15, Identifier: 1,
+					}},
+				})
+				time.Sleep(30 * time.Millisecond)
+
+				// Swipe movement
+				for i := 1; i <= steps; i++ {
+					progress := float64(i) / float64(steps)
+					currentX := startX + int(float64(endX-startX)*progress)
+					currentY := startY + int(float64(endY-startY)*progress)
+
+					emuClient.SendTouch(&pb.TouchEvent{
+						Touches: []*pb.Touch{{
+							X: int32(currentX), Y: int32(currentY),
+							Pressure: 80, TouchMajor: 15, TouchMinor: 15, Identifier: 1,
+						}},
+					})
+					time.Sleep(time.Duration(stepDuration) * time.Millisecond)
+				}
+
+				// Touch up
+				emuClient.SendTouch(&pb.TouchEvent{
+					Touches: []*pb.Touch{{
+						X: int32(endX), Y: int32(endY),
+						Pressure: 0, TouchMajor: 15, TouchMinor: 15, Identifier: 1,
+					}},
+				})
+			}
+		}
+	case "key":
+		if len(args) >= 1 {
+			if keyCode, err := strconv.Atoi(args[0]); err == nil {
+				emuClient.SendKey(&pb.KeyboardEvent{
+					CodeType:  pb.KeyboardEvent_Evdev,
+					EventType: pb.KeyboardEvent_keypress,
+					KeyCode:   int32(keyCode),
+				})
+			} else {
+				emuClient.SendKey(&pb.KeyboardEvent{
+					CodeType:  pb.KeyboardEvent_Evdev,
+					EventType: pb.KeyboardEvent_keypress,
+					Key:       args[0],
+				})
+			}
+		}
+	case "text":
+		if len(args) >= 1 {
+			text := strings.Join(args, ":")
+			for _, char := range text {
+				emuClient.SendKey(&pb.KeyboardEvent{
+					CodeType:  pb.KeyboardEvent_Evdev,
+					EventType: pb.KeyboardEvent_keypress,
+					Text:      string(char),
+				})
+			}
+		}
 	}
-
-	api := webrtc.NewAPI(webrtc.WithMediaEngine(mediaEngine))
-
-	pc, err := api.NewPeerConnection(webrtc.Configuration{
-		ICEServers: []webrtc.ICEServer{
-			{URLs: []string{"stun:stun.l.google.com:19302"}},
-		},
-	})
-	if err != nil {
-		log.Println("NewPeerConnection error:", err)
-		http.Error(w, err.Error(), 500)
-		return
-	}
-	log.Println("✔ PeerConnection created")
-
-	// Connection state logging
-	pc.OnConnectionStateChange(func(state webrtc.PeerConnectionState) {
-		log.Printf("Connection state: %s", state.String())
-	})
-
-	pc.OnICEConnectionStateChange(func(state webrtc.ICEConnectionState) {
-		log.Printf("ICE state: %s", state.String())
-	})
-
-	// Create H.264 video track
-	videoTrack, err := webrtc.NewTrackLocalStaticSample(
-		webrtc.RTPCodecCapability{
-			MimeType:    webrtc.MimeTypeH264,
-			ClockRate:   90000,
-			SDPFmtpLine: "level-asymmetry-allowed=1;packetization-mode=1;profile-level-id=42e01f",
-		},
-		"video", "android-screen",
-	)
-	if err != nil {
-		log.Println("❌ NewTrackLocalStaticSample error:", err)
-		http.Error(w, err.Error(), 500)
-		return
-	}
-
-	_, err = pc.AddTrack(videoTrack)
-	if err != nil {
-		log.Println("❌ AddTrack error:", err)
-		http.Error(w, err.Error(), 500)
-		return
-	}
-	log.Println("✔ H.264 video track added")
-
-	// Set broadcaster
-	mu.Lock()
-	broadcaster = emulator.NewBroadcaster(videoTrack)
-	mu.Unlock()
-
-	// Apply remote offer
-	if err := pc.SetRemoteDescription(offer); err != nil {
-		log.Println("❌ SetRemoteDescription error:", err)
-		http.Error(w, err.Error(), 500)
-		return
-	}
-	log.Println("✔ Remote description set")
-
-	// Create answer
-	answer, err := pc.CreateAnswer(nil)
-	if err != nil {
-		log.Println("❌ CreateAnswer error:", err)
-		http.Error(w, err.Error(), 500)
-		return
-	}
-
-	// Apply local description
-	if err := pc.SetLocalDescription(answer); err != nil {
-		log.Println("❌ SetLocalDescription error:", err)
-		http.Error(w, err.Error(), 500)
-		return
-	}
-
-	log.Println("✔ Local description set")
-	log.Println("Answer SDP length:", len(answer.SDP))
-
-	// Respond with answer
-	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(answer)
-
-	log.Println("=== /offer completed ===")
 }
 
 func startFrameLoop() {
-	const fps = 30
+	const fps = 15 // Target FPS
 	frameDuration := time.Second / fps
+	frameCount := 0
+	lastLogTime := time.Now()
+	consecutiveErrors := 0
 
-	log.Println("🎬 Frame loop started, waiting for broadcaster...")
+	log.Printf("🎬 Frame loop started @ %d fps", fps)
+
+	var lastImg *image.RGBA
 
 	for {
 		mu.Lock()
 		bc := broadcaster
 		mu.Unlock()
 
-		if bc == nil {
+		if bc == nil || emuClient == nil {
 			time.Sleep(100 * time.Millisecond)
 			continue
 		}
 
 		frameStart := time.Now()
 
-		// Get frame from emulator
-		img, err := emuClient.GetFrame()
-		if err != nil {
-			log.Println("❌ GetFrame error:", err)
+		// Get frame with timeout
+		frameCh := make(chan image.Image, 1)
+		errCh := make(chan error, 1)
+
+		go func() {
+			img, err := emuClient.GetFrame()
+			if err != nil {
+				errCh <- err
+				return
+			}
+			frameCh <- img
+		}()
+
+		var img image.Image
+		select {
+		case img = <-frameCh:
+			consecutiveErrors = 0
+		case err := <-errCh:
+			consecutiveErrors++
+			if consecutiveErrors%10 == 1 {
+				log.Printf("❌ GetFrame error: %v", err)
+			}
 			time.Sleep(frameDuration)
 			continue
+		case <-time.After(30 * time.Second):
+			log.Printf("❌ GetFrame timeout")
+			time.Sleep(2 * time.Second)
+			continue
 		}
+
 		if img == nil {
 			time.Sleep(frameDuration)
 			continue
 		}
 
+		// Convert to RGBA if needed
+		rgba, ok := img.(*image.RGBA)
+		if !ok {
+			bounds := img.Bounds()
+			if lastImg == nil || lastImg.Bounds() != bounds {
+				lastImg = image.NewRGBA(bounds)
+			}
+			for y := bounds.Min.Y; y < bounds.Max.Y; y++ {
+				for x := bounds.Min.X; x < bounds.Max.X; x++ {
+					lastImg.Set(x, y, img.At(x, y))
+				}
+			}
+			rgba = lastImg
+		}
+
 		// Initialize encoder on first frame
 		if h264Enc == nil {
-			bounds := img.Bounds()
-			w := bounds.Dx()
-			h := bounds.Dy()
-			h264Enc, err = emulator.NewH264Encoder(w, h, fps)
-			if err != nil {
-				log.Printf("❌ Failed to create H264 encoder: %v", err)
+			bounds := rgba.Bounds()
+			w, h := bounds.Dx(), bounds.Dy()
+			var encErr error
+			h264Enc, encErr = emulator.NewH264Encoder(w, h, fps)
+			if encErr != nil {
+				log.Printf("❌ Failed to create H264 encoder: %v", encErr)
 				time.Sleep(time.Second)
 				continue
 			}
 			log.Printf("🎥 H.264 encoder initialized: %dx%d @ %d fps", w, h, fps)
 		}
 
-		// Encode frame to H.264
-		h264Data, err := h264Enc.Encode(img)
+		// Encode frame
+		h264Data, err := h264Enc.Encode(rgba)
 		if err != nil {
-			log.Println("❌ H264 Encode error:", err)
+			log.Printf("❌ H264 Encode error: %v", err)
+			time.Sleep(frameDuration)
 			continue
 		}
 
-		if h264Data != nil && len(h264Data) > 0 {
-			if err := bc.SendH264(h264Data); err != nil {
-				log.Println("❌ SendH264 error:", err)
+		if len(h264Data) == 0 {
+			continue // Encoder still processing
+		}
+		nals := emulator.ParseNALUnits(h264Data)
+		// Send frame
+		if err := bc.SendH264NALs(nals); err != nil {
+			errStr := err.Error()
+			if strings.Contains(errStr, "connection") || strings.Contains(errStr, "closed") {
+				mu.Lock()
+				broadcaster = nil
+				mu.Unlock()
+			}
+		} else {
+			frameCount++
+			// Log stats every 5 seconds
+			if time.Since(lastLogTime) > 5*time.Second {
+				log.Printf("📡 Frames sent: %d, FPS: %.1f", frameCount, float64(frameCount)/time.Since(lastLogTime).Seconds())
+				frameCount = 0
+				lastLogTime = time.Now()
 			}
 		}
 

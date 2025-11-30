@@ -7,44 +7,97 @@ import (
 	"io"
 	"log"
 	"os/exec"
+	"strconv"
 	"sync"
+	"time"
 )
 
 type H264Encoder struct {
-	cmd    *exec.Cmd
-	stdin  io.WriteCloser
-	stdout io.ReadCloser
-	width  int
-	height int
-	mu     sync.Mutex
-	buf    []byte
+	cmd       *exec.Cmd
+	stdin     io.WriteCloser
+	stdout    io.ReadCloser
+	width     int
+	height    int
+	mu        sync.Mutex
+	outputBuf chan []byte
+	closed    bool
+	frameNum  int64
 }
 
+func (e *H264Encoder) Output() <-chan []byte {
+	return e.outputBuf
+}
+
+// NewH264Encoder creates a new H264 encoder optimized for ultra-low latency streaming
 func NewH264Encoder(width, height int, fps int) (*H264Encoder, error) {
+	// Try NVIDIA NVENC first, fall back to x264 if not available
+	return newNVENCEncoder(width, height, fps)
+	// return enc, nil
+}
+
+// newNVENCEncoder creates an NVIDIA hardware-accelerated encoder
+func newNVENCEncoder(width, height int, fps int) (*H264Encoder, error) {
+	// Simplified NVIDIA NVENC settings
 	cmd := exec.Command("ffmpeg",
 		"-f", "rawvideo",
 		"-pix_fmt", "rgba",
 		"-s", fmt.Sprintf("%dx%d", width, height),
-		"-r", fmt.Sprintf("%d", fps),
+		"-r", strconv.Itoa(fps),
 		"-i", "pipe:0",
 		"-an",
-		"-c:v", "libx264",
-		"-preset", "ultrafast",
-		"-tune", "zerolatency",
-		"-profile:v", "baseline", // Better browser compatibility
-		"-level", "3.1",
-		"-pix_fmt", "yuv420p",
-		"-g", fmt.Sprintf("%d", fps), // Keyframe every second
-		"-keyint_min", fmt.Sprintf("%d", fps),
-		"-sc_threshold", "0",
+		"-c:v", "h264_nvenc",
+		"-preset", "fast",
+		"-rc", "cbr",
 		"-b:v", "2M",
 		"-maxrate", "2M",
-		"-bufsize", "4M",
+		"-bufsize", "1M",
+		"-pix_fmt", "yuv420p",
+		"-g", strconv.Itoa(fps*2), // Keyframe every 2 seconds
+		"-keyint_min", "1",
+		"-profile:v", "main",
+		"-level", "4.0",
 		"-f", "h264",
-		"-bsf:v", "h264_mp4toannexb", // Ensure Annex B format with start codes
+		"-bsf:v", "h264_mp4toannexb",
+		"-flags", "+cgop", // Ensure SPS/PPS are repeated
 		"pipe:1",
 	)
 
+	return setupEncoder(cmd, width, height)
+}
+
+// newX264Encoder creates a software x264 encoder (fallback)
+func newX264Encoder(width, height int, fps int) (*H264Encoder, error) {
+	// x264 with ultra-low latency settings
+	cmd := exec.Command("ffmpeg",
+		"-f", "rawvideo",
+		"-pix_fmt", "rgba",
+		"-s", fmt.Sprintf("%dx%d", width, height),
+		"-r", strconv.Itoa(fps),
+		"-i", "pipe:0",
+		"-an",
+		// x264 software encoder
+		"-c:v", "libx264",
+		"-preset", "ultrafast", // Fastest preset
+		"-tune", "zerolatency", // Zero latency tuning
+		"-crf", "23", // Quality level
+		"-pix_fmt", "yuv420p",
+		"-g", fmt.Sprintf("%d", fps),
+		"-keyint_min", "1",
+		"-profile:v", "baseline",
+		"-level", "4.2",
+		"-x264-params", "keyint=10:min-keyint=10:no-scenecut",
+		"-f", "h264",
+		"-bsf:v", "h264_mp4toannexb",
+		"-flags", "+cgop", // Ensure SPS/PPS are repeated
+		"-flush_packets", "1",
+		"pipe:1",
+	)
+
+	return setupEncoder(cmd, width, height)
+}
+
+// setupEncoder initializes the encoder process
+func setupEncoder(cmd *exec.Cmd, width, height int) (*H264Encoder, error) {
 	stdin, err := cmd.StdinPipe()
 	if err != nil {
 		return nil, fmt.Errorf("stdin pipe: %w", err)
@@ -58,14 +111,14 @@ func NewH264Encoder(width, height int, fps int) (*H264Encoder, error) {
 	// Log stderr for debugging
 	stderr, _ := cmd.StderrPipe()
 	go func() {
-		buf := make([]byte, 1024)
+		buf := make([]byte, 4096)
 		for {
 			n, err := stderr.Read(buf)
 			if err != nil {
 				return
 			}
 			if n > 0 {
-				log.Printf("[ffmpeg] %s", string(buf[:n]))
+				log.Printf("🎬 FFmpeg: %s", string(buf[:n]))
 			}
 		}
 	}()
@@ -74,22 +127,70 @@ func NewH264Encoder(width, height int, fps int) (*H264Encoder, error) {
 		return nil, fmt.Errorf("ffmpeg start: %w", err)
 	}
 
-	log.Printf("✅ H264 encoder started: %dx%d @ %d fps", width, height, fps)
+	enc := &H264Encoder{
+		cmd:       cmd,
+		stdin:     stdin,
+		stdout:    stdout,
+		width:     width,
+		height:    height,
+		outputBuf: make(chan []byte, 20), // Small buffer for low latency
+		closed:    false,
+	}
 
-	return &H264Encoder{
-		cmd:    cmd,
-		stdin:  stdin,
-		stdout: stdout,
-		width:  width,
-		height: height,
-		buf:    make([]byte, 0, 1024*1024), // 1MB buffer
-	}, nil
+	// Start background reader goroutine
+	go enc.readLoop()
+
+	return enc, nil
+}
+
+// readLoop continuously reads from ffmpeg stdout
+func (e *H264Encoder) readLoop() {
+	readBuf := make([]byte, 128*1024) // 128KB read buffer
+	totalBytes := 0
+	for {
+		n, err := e.stdout.Read(readBuf)
+		if err != nil {
+			log.Printf("🔴 H264 encoder read loop ended: %v (total bytes read: %d)", err, totalBytes)
+			close(e.outputBuf)
+			return
+		}
+		if n > 0 {
+			totalBytes += n
+			log.Printf("📦 H264 encoder produced %d bytes (total: %d)", n, totalBytes)
+
+			// Copy the data since we're reusing the buffer
+			data := make([]byte, n)
+			copy(data, readBuf[:n])
+
+			// Non-blocking send - drop old frames if buffer is full to keep latency low
+			select {
+			case e.outputBuf <- data:
+				log.Printf("✅ H264 data queued for sending")
+			default:
+				// Buffer full - drain oldest and add new
+				log.Printf("⚠️ H264 buffer full, dropping old frame")
+				select {
+				case <-e.outputBuf:
+				default:
+				}
+				select {
+				case e.outputBuf <- data:
+				default:
+				}
+			}
+		}
+	}
 }
 
 // Encode sends an RGBA frame to ffmpeg and reads back H.264 NAL units
+// Optimized for minimal latency
 func (e *H264Encoder) Encode(img image.Image) ([]byte, error) {
 	e.mu.Lock()
 	defer e.mu.Unlock()
+
+	if e.closed {
+		return nil, fmt.Errorf("encoder is closed")
+	}
 
 	// Convert image.Image → RGBA byte slice
 	rgba, ok := img.(*image.RGBA)
@@ -103,19 +204,26 @@ func (e *H264Encoder) Encode(img image.Image) ([]byte, error) {
 		return nil, fmt.Errorf("write to ffmpeg: %w", err)
 	}
 
-	// Read available H.264 data from ffmpeg
-	// ffmpeg buffers internally, so we read what's available
-	readBuf := make([]byte, 256*1024) // 256KB read buffer
-	n, err := e.stdout.Read(readBuf)
-	if err != nil && err != io.EOF {
-		return nil, fmt.Errorf("read from ffmpeg: %w", err)
+	e.frameNum++
+
+	// Read available H.264 data - use longer timeout for encoder warmup
+	// First frames need much longer due to encoder initialization
+	timeout := 100 * time.Millisecond
+	if e.frameNum < 10 {
+		timeout = 500 * time.Millisecond // Much longer timeout for initial frames
 	}
 
-	if n == 0 {
+	select {
+	case data, ok := <-e.outputBuf:
+		if !ok {
+			return nil, fmt.Errorf("encoder output closed")
+		}
+		return data, nil
+	case <-time.After(timeout):
+		// No data available yet - encoder is still processing
+		// Return nil without error to allow frame loop to continue
 		return nil, nil
 	}
-
-	return readBuf[:n], nil
 }
 
 // EncodeWithNALs sends a frame and returns parsed NAL units
@@ -133,13 +241,13 @@ func (e *H264Encoder) EncodeWithNALs(img image.Image) ([][]byte, error) {
 // ParseNALUnits splits H.264 Annex B stream into individual NAL units
 func ParseNALUnits(data []byte) [][]byte {
 	var nals [][]byte
-	
+
 	// Find all start codes (0x00 0x00 0x01 or 0x00 0x00 0x00 0x01)
 	startCode3 := []byte{0x00, 0x00, 0x01}
 	startCode4 := []byte{0x00, 0x00, 0x00, 0x01}
-	
+
 	var positions []int
-	
+
 	for i := 0; i < len(data); {
 		if i+4 <= len(data) && bytes.Equal(data[i:i+4], startCode4) {
 			positions = append(positions, i)
@@ -151,7 +259,7 @@ func ParseNALUnits(data []byte) [][]byte {
 			i++
 		}
 	}
-	
+
 	// Extract NAL units between start codes
 	for i := 0; i < len(positions); i++ {
 		start := positions[i]
@@ -161,23 +269,26 @@ func ParseNALUnits(data []byte) [][]byte {
 		} else {
 			end = len(data)
 		}
-		
+
 		// Skip the start code itself
 		nalStart := start + 3
 		if start+4 <= len(data) && bytes.Equal(data[start:start+4], startCode4) {
 			nalStart = start + 4
 		}
-		
+
 		if nalStart < end {
 			// Include start code for WebRTC (Annex B format)
 			nals = append(nals, data[start:end])
 		}
 	}
-	
+
 	return nals
 }
 
 func (e *H264Encoder) Close() error {
+	e.mu.Lock()
+	e.closed = true
+	e.mu.Unlock()
 	e.stdin.Close()
 	return e.cmd.Wait()
 }
