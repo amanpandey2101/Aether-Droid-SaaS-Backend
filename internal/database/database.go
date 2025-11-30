@@ -55,9 +55,9 @@ func NewService() (*Service, error) {
 		return nil, fmt.Errorf("failed to ping MongoDB: %w", err)
 	}
 
-	database := client.Database("aether") // Use the same database as Next.js
+	database := client.Database("avibar")
 
-	log.Println("✅ Connected to MongoDB")
+	log.Println("Connected to MongoDB")
 	return &Service{
 		client:   client,
 		database: database,
