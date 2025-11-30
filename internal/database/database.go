@@ -41,9 +41,6 @@ func NewService() (*Service, error) {
 	defer cancel()
 
 	mongoURL := os.Getenv("DATABASE_URL")
-	if mongoURL == "" {
-		mongoURL = "mongodb+srv://anantkrplay:LTUWn3SFEFLqmm4f@cluster0.vef3wic.mongodb.net/avibar?retryWrites=true&w=majority"
-	}
 	// if mongoURL == "" {
 	// 	return nil, fmt.Errorf("DATABASE_URL environment variable not set")
 	// }
