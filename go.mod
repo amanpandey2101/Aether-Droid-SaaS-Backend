@@ -1,6 +1,6 @@
 module android_cloud_backend
 
-go 1.24.0
+go 1.24.10
 
 require (
 	github.com/pion/webrtc/v3 v3.3.6
@@ -14,6 +14,7 @@ require (
 	github.com/golang-jwt/jwt/v5 v5.3.0 // indirect
 	github.com/golang/snappy v0.0.4 // indirect
 	github.com/google/uuid v1.6.0 // indirect
+	github.com/joho/godotenv v1.5.1 // indirect
 	github.com/klauspost/compress v1.16.7 // indirect
 	github.com/montanaflynn/stats v0.7.1 // indirect
 	github.com/pion/datachannel v1.5.8 // indirect

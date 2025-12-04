@@ -6,7 +6,6 @@ import (
 	"log"
 	"os"
 	"time"
-
 	"android_cloud_backend/internal/models"
 
 	"go.mongodb.org/mongo-driver/bson"
@@ -20,7 +19,7 @@ type Service struct {
 	database *mongo.Database
 }
 
-// ContainerDocument represents the container document in MongoDB
+
 type ContainerDocument struct {
 	ID          string     `bson:"_id,omitempty"`
 	UserID      string     `bson:"user_id"`
@@ -41,9 +40,9 @@ func NewService() (*Service, error) {
 	defer cancel()
 
 	mongoURL := os.Getenv("DATABASE_URL")
-	// if mongoURL == "" {
-	// 	return nil, fmt.Errorf("DATABASE_URL environment variable not set")
-	// }
+	if mongoURL == "" {
+		return nil, fmt.Errorf("DATABASE_URL environment variable not set")
+	}
 
 	client, err := mongo.Connect(ctx, options.Client().ApplyURI(mongoURL))
 	if err != nil {
@@ -87,7 +86,7 @@ func (s *Service) CreateContainer(ctx context.Context, container *models.Emulato
 		return fmt.Errorf("failed to insert container: %w", err)
 	}
 
-	log.Printf("💾 Saved container %s for user %s", container.ID[:12], container.UserID)
+	log.Printf("Saved container %s for user %s", container.ID[:12], container.UserID)
 	return nil
 }
 
@@ -115,7 +114,7 @@ func (s *Service) UpdateContainerStatus(ctx context.Context, containerID string,
 	return nil
 }
 
-// GetUserContainers retrieves all containers for a user
+
 func (s *Service) GetUserContainers(ctx context.Context, userID string) ([]*models.EmulatorContainer, error) {
 	collection := s.database.Collection("emulators")
 

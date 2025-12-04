@@ -30,10 +30,19 @@ func (e *H264Encoder) Output() <-chan []byte {
 
 // NewH264Encoder creates a new H264 encoder optimized for ultra-low latency streaming
 func NewH264Encoder(width, height int, fps int) (*H264Encoder, error) {
-	// Try NVIDIA NVENC first, fall back to x264 if not available
-	return newNVENCEncoder(width, height, fps)
-	// return enc, nil
+    // Try NVENC first
+    enc, err := newX264Encoder(width, height, fps)
+    if err == nil {
+        log.Println("🔥 Using NVIDIA NVENC encoder")
+        return enc, nil
+    }
+
+    log.Println("⚠️ NVENC not available, falling back to libx264:", err)
+
+    // Fallback: software x264 encoder (always works, no GPU required)
+    return newX264Encoder(width, height, fps)
 }
+
 
 // newNVENCEncoder creates an NVIDIA hardware-accelerated encoder
 func newNVENCEncoder(width, height int, fps int) (*H264Encoder, error) {
@@ -67,34 +76,56 @@ func newNVENCEncoder(width, height int, fps int) (*H264Encoder, error) {
 
 // newX264Encoder creates a software x264 encoder (fallback)
 func newX264Encoder(width, height int, fps int) (*H264Encoder, error) {
-	// x264 with ultra-low latency settings
 	cmd := exec.Command("ffmpeg",
+		// Input raw video
 		"-f", "rawvideo",
 		"-pix_fmt", "rgba",
 		"-s", fmt.Sprintf("%dx%d", width, height),
 		"-r", strconv.Itoa(fps),
 		"-i", "pipe:0",
+		"-vf", "scale=540:-1",  
+
+		// No audio
 		"-an",
-		// x264 software encoder
+
+
 		"-c:v", "libx264",
-		"-preset", "ultrafast", // Fastest preset
-		"-tune", "zerolatency", // Zero latency tuning
-		"-crf", "23", // Quality level
+		"-preset", "veryfast",        
+		"-tune", "zerolatency",      
+
+		// 🔥 Bitrate & rate control
+		"-b:v", "2M",                  // Target bitrate
+		"-maxrate", "2M",
+		"-bufsize", "1M",
+
+		// Pixel format for WebRTC
 		"-pix_fmt", "yuv420p",
-		"-g", fmt.Sprintf("%d", fps),
+
+		// Keyframe interval
+		"-g", fmt.Sprintf("%d", fps*2), // Keyframe every 2 seconds
 		"-keyint_min", "1",
+
+		// Profile for compatibility
 		"-profile:v", "baseline",
-		"-level", "4.2",
-		"-x264-params", "keyint=10:min-keyint=10:no-scenecut",
+		"-level", "4.1",
+
+		// ⚡ Critical x264 parameters for latency
+		"-x264-params",
+		// No B-frames, instant decode, repeated SPS/PPS, no scenecut
+		"bframes=0:repeat-headers=1:scenecut=0:keyint=30:min-keyint=1",
+
+		// Output format
 		"-f", "h264",
 		"-bsf:v", "h264_mp4toannexb",
-		"-flags", "+cgop", // Ensure SPS/PPS are repeated
 		"-flush_packets", "1",
+
+		// Output pipe
 		"pipe:1",
 	)
 
 	return setupEncoder(cmd, width, height)
 }
+
 
 // setupEncoder initializes the encoder process
 func setupEncoder(cmd *exec.Cmd, width, height int) (*H264Encoder, error) {

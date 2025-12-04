@@ -10,6 +10,8 @@ import (
 	"strings"
 	"sync"
 	"time"
+	"github.com/joho/godotenv"
+	"fmt"
 
 	"android_cloud_backend/internal/api"
 	"android_cloud_backend/internal/config"
@@ -29,17 +31,17 @@ var (
 
 func main() {
 	// Load configuration
-	cfg = config.Load()
-	log.Println("🚀 Starting Aether Android Cloud Backend")
-
-	// Initialize database service
+	err := godotenv.Load(".env")
+	if err != nil {
+		fmt.Println("No .env file found")
+	}
 	dbService, err := database.NewService()
 	if err != nil {
-		log.Printf("⚠️  Database service not available: %v", err)
-		log.Println("💾 Database operations will be disabled")
-		dbService = nil
+		log.Fatal(err)
 	}
 
+	cfg = config.Load()
+	log.Println("🚀 Starting Aether Android Cloud Backend")
 	// Initialize container manager
 	containerManager, err := container.NewManager(cfg, dbService)
 	if err != nil {
@@ -115,20 +117,20 @@ func main() {
 		api.CORSMiddleware(cfg.Server.AllowedOrigins),
 	)
 
-	serverAddr := ":" + cfg.Server.Port
+	serverAddr := ":3001"
 	log.Printf("🌐 Server listening on %s", serverAddr)
-	log.Println("📖 API Endpoints:")
-	log.Println("   GET  /health              - Health check")
-	log.Println("   GET  /api/health          - API health check")
-	log.Println("   GET  /api/images          - List available emulator images")
-	log.Println("   GET  /api/containers      - List containers")
-	log.Println("   POST /api/containers      - Create container")
-	log.Println("   GET  /api/containers/{id} - Get container details")
-	log.Println("   POST /api/containers/{id}/stop   - Stop container")
-	log.Println("   DELETE /api/containers/{id}      - Delete container")
-	log.Println("   GET  /api/containers/{id}/connect - Get connection info")
-	log.Println("   POST /offer               - WebRTC offer (default emulator)")
-	log.Println("   POST /offer/{container_id} - WebRTC offer (specific container)")
+	// log.Println("📖 API Endpoints:")
+	// log.Println("   GET  /health              - Health check")
+	// log.Println("   GET  /api/health          - API health check")
+	// log.Println("   GET  /api/images          - List available emulator images")
+	// log.Println("   GET  /api/containers      - List containers")
+	// log.Println("   POST /api/containers      - Create container")
+	// log.Println("   GET  /api/containers/{id} - Get container details")
+	// log.Println("   POST /api/containers/{id}/stop   - Stop container")
+	// log.Println("   DELETE /api/containers/{id}      - Delete container")
+	// log.Println("   GET  /api/containers/{id}/connect - Get connection info")
+	// log.Println("   POST /offer               - WebRTC offer (default emulator)")
+	// log.Println("   POST /offer/{container_id} - WebRTC offer (specific container)")
 
 	log.Fatal(http.ListenAndServe(serverAddr, handler))
 }

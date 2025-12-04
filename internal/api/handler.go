@@ -534,9 +534,28 @@ func (h *Handler) handleOffer(w http.ResponseWriter, r *http.Request, containerI
 	}
 
 	// Create WebRTC peer connection
+	// peerConnection, err := webrtc.NewPeerConnection(webrtc.Configuration{
+	// 	ICEServers: []webrtc.ICEServer{{URLs: []string{"stun:stun.l.google.com:19302"}}},
+	// })
 	peerConnection, err := webrtc.NewPeerConnection(webrtc.Configuration{
-		ICEServers: []webrtc.ICEServer{{URLs: []string{"stun:stun.l.google.com:19302"}}},
+		ICEServers: []webrtc.ICEServer{
+			{
+				URLs: []string{
+					"stun:stun.l.google.com:19302",
+				},
+			},
+			{
+				URLs: []string{
+					"turn:34.180.37.161:3478?transport=udp",
+					"turn:34.180.37.161:3478?transport=tcp",
+				},
+				Username:   "dev",
+				Credential: "dev123",
+			},
+		},
+		ICETransportPolicy: webrtc.ICETransportPolicyAll,
 	})
+	
 	if err != nil {
 		h.sendError(w, http.StatusInternalServerError, "Failed to create peer connection", "WEBRTC_ERROR")
 		return
