@@ -11,6 +11,8 @@ import (
 	"sync"
 	"time"
 
+	"github.com/joho/godotenv"
+
 	"android_cloud_backend/internal/api"
 	"android_cloud_backend/internal/config"
 	"android_cloud_backend/internal/container"
@@ -29,31 +31,33 @@ var (
 
 func main() {
 	// Load configuration
-	cfg = config.Load()
-	log.Println("🚀 Starting Aether Android Cloud Backend")
+	err := godotenv.Load(".env")
+	if err != nil {
+		log.Println("No .env file found")
+	}
 
 	// Initialize database service
 	dbService, err := database.NewService()
 	if err != nil {
-		log.Printf("⚠️  Database service not available: %v", err)
-		log.Println("💾 Database operations will be disabled")
-		dbService = nil
+		log.Fatal("Database connection failed:", err)
 	}
+	cfg = config.Load()
+	log.Println(" Starting Aether Android Cloud Backend")
 
 	// Initialize container manager
 	containerManager, err := container.NewManager(cfg, dbService)
 	if err != nil {
-		log.Printf("⚠️  Container manager not available: %v", err)
-		log.Println("📦 Container management will return errors, but API routes are available")
+		log.Printf(" Container manager not available: %v", err)
+		log.Println(" Container management will return errors, but API routes are available")
 		containerManager = nil
 	}
 
 	// Create API router (always available, even if services are not)
 	apiRouter := api.NewRouter(containerManager, cfg)
 	if containerManager != nil && dbService != nil {
-		log.Println("✅ Container management API with database enabled")
+		log.Println(" Container management API with database enabled")
 	} else {
-		log.Println("⚠️  Container management API mounted but some services unavailable")
+		log.Println(" Container management API mounted but some services unavailable")
 	}
 
 	// Get emulator address from environment or use default
@@ -61,15 +65,15 @@ func main() {
 	if emulatorAddr == "" {
 		emulatorAddr = "localhost:8554"
 	}
-	log.Printf("📱 Emulator address: %s", emulatorAddr)
+	log.Printf(" Emulator address: %s", emulatorAddr)
 
 	// Try to connect to emulator (optional - may not be running)
 	emuClient, err = emulator.NewEmulatorClient(emulatorAddr)
 	if err != nil {
-		log.Printf("⚠️  Emulator not connected: %v", err)
-		log.Println("📺 WebRTC streaming will be available when emulator connects")
+		log.Printf(" Emulator not connected: %v", err)
+		log.Println(" WebRTC streaming will be available when emulator connects")
 	} else {
-		log.Printf("✅ Connected to emulator gRPC at %s", emulatorAddr)
+		log.Printf(" Connected to emulator gRPC at %s", emulatorAddr)
 	}
 
 	// Create HTTP mux
@@ -104,8 +108,10 @@ func main() {
 		})
 	})
 
-	// Start frame loop in background
-	go startFrameLoop()
+	// DEPRECATED: Old frame loop - replaced by GPU bridge architecture
+	// The bridge now runs inside containers with hardware encoding
+	// go startFrameLoop()
+	log.Println("🎬 GPU bridge streaming enabled - Go server handles signaling only")
 
 	// Apply middleware
 	handler := api.ChainMiddleware(
@@ -116,26 +122,26 @@ func main() {
 	)
 
 	serverAddr := ":" + cfg.Server.Port
-	log.Printf("🌐 Server listening on %s", serverAddr)
-	log.Println("📖 API Endpoints:")
-	log.Println("   GET  /health              - Health check")
-	log.Println("   GET  /api/health          - API health check")
-	log.Println("   GET  /api/images          - List available emulator images")
-	log.Println("   GET  /api/containers      - List containers")
-	log.Println("   POST /api/containers      - Create container")
-	log.Println("   GET  /api/containers/{id} - Get container details")
-	log.Println("   POST /api/containers/{id}/stop   - Stop container")
-	log.Println("   DELETE /api/containers/{id}      - Delete container")
-	log.Println("   GET  /api/containers/{id}/connect - Get connection info")
-	log.Println("   POST /offer               - WebRTC offer (default emulator)")
-	log.Println("   POST /offer/{container_id} - WebRTC offer (specific container)")
+	log.Printf(" Server listening on %s", serverAddr)
+	// log.Println("📖 API Endpoints:")
+	// log.Println("   GET  /health              - Health check")
+	// log.Println("   GET  /api/health          - API health check")
+	// log.Println("   GET  /api/images          - List available emulator images")
+	// log.Println("   GET  /api/containers      - List containers")
+	// log.Println("   POST /api/containers      - Create container")
+	// log.Println("   GET  /api/containers/{id} - Get container details")
+	// log.Println("   POST /api/containers/{id}/stop   - Stop container")
+	// log.Println("   DELETE /api/containers/{id}      - Delete container")
+	// log.Println("   GET  /api/containers/{id}/connect - Get connection info")
+	// log.Println("   POST /offer               - WebRTC offer (default emulator)")
+	// log.Println("   POST /offer/{container_id} - WebRTC offer (specific container)")
 
 	log.Fatal(http.ListenAndServe(serverAddr, handler))
 }
 
 func handleInputCommand(cmd string) {
 	if emuClient == nil {
-		log.Printf("❌ No emulator client for input: %s", cmd)
+		log.Printf(" No emulator client for input: %s", cmd)
 		return
 	}
 
@@ -237,6 +243,17 @@ func handleInputCommand(cmd string) {
 	}
 }
 
+// DEPRECATED: startFrameLoop - Legacy global frame loop
+// This function is no longer used. The GPU bridge architecture handles
+// video streaming inside individual containers with hardware encoding.
+//
+// The new architecture:
+// - Emulator renders to virtio-gpu framebuffer
+// - ffmpeg inside container captures and encodes with VAAPI/NVENC
+// - H.264 NALs sent directly to WebRTC
+// - Go server only handles signaling, not pixels
+//
+// TODO: Remove this function after full migration validation
 func startFrameLoop() {
 	const fps = 15 // Target FPS
 	frameDuration := time.Second / fps
@@ -244,7 +261,7 @@ func startFrameLoop() {
 	lastLogTime := time.Now()
 	consecutiveErrors := 0
 
-	log.Printf("🎬 Frame loop started @ %d fps", fps)
+	log.Printf(" Frame loop started @ %d fps", fps)
 
 	var lastImg *image.RGBA
 
@@ -280,12 +297,12 @@ func startFrameLoop() {
 		case err := <-errCh:
 			consecutiveErrors++
 			if consecutiveErrors%10 == 1 {
-				log.Printf("❌ GetFrame error: %v", err)
+				log.Printf(" GetFrame error: %v", err)
 			}
 			time.Sleep(frameDuration)
 			continue
 		case <-time.After(30 * time.Second):
-			log.Printf("❌ GetFrame timeout")
+			log.Printf(" GetFrame timeout")
 			time.Sleep(2 * time.Second)
 			continue
 		}
@@ -317,17 +334,17 @@ func startFrameLoop() {
 			var encErr error
 			h264Enc, encErr = emulator.NewH264Encoder(w, h, fps)
 			if encErr != nil {
-				log.Printf("❌ Failed to create H264 encoder: %v", encErr)
+				log.Printf(" Failed to create H264 encoder: %v", encErr)
 				time.Sleep(time.Second)
 				continue
 			}
-			log.Printf("🎥 H.264 encoder initialized: %dx%d @ %d fps", w, h, fps)
+			log.Printf(" H.264 encoder initialized: %dx%d @ %d fps", w, h, fps)
 		}
 
 		// Encode frame
 		h264Data, err := h264Enc.Encode(rgba)
 		if err != nil {
-			log.Printf("❌ H264 Encode error: %v", err)
+			log.Printf(" H264 Encode error: %v", err)
 			time.Sleep(frameDuration)
 			continue
 		}
@@ -348,7 +365,7 @@ func startFrameLoop() {
 			frameCount++
 			// Log stats every 5 seconds
 			if time.Since(lastLogTime) > 5*time.Second {
-				log.Printf("📡 Frames sent: %d, FPS: %.1f", frameCount, float64(frameCount)/time.Since(lastLogTime).Seconds())
+				log.Printf(" Frames sent: %d, FPS: %.1f", frameCount, float64(frameCount)/time.Since(lastLogTime).Seconds())
 				frameCount = 0
 				lastLogTime = time.Now()
 			}

@@ -12,13 +12,6 @@ import (
 	"github.com/golang-jwt/jwt/v5"
 )
 
-// min returns the minimum of two integers
-func min(a, b int) int {
-	if a < b {
-		return a
-	}
-	return b
-}
 
 // CORSMiddleware handles CORS headers
 func CORSMiddleware(allowedOrigins []string) func(http.Handler) http.Handler {

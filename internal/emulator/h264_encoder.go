@@ -1,68 +1,126 @@
+// Package emulator contains emulator client and encoding utilities
+//
+// DEPRECATED: h264_encoder.go
+// This file is deprecated and scheduled for removal.
+// The new GPU bridge architecture (internal/bridge/) handles video encoding
+// directly inside containers using VAAPI/NVENC hardware acceleration.
+//
+// Migration path:
+// - Go server no longer processes raw frames
+// - Encoding happens inside container via ffmpeg with hardware acceleration
+// - This file is kept for backward compatibility only
+//
+// TODO: Remove this file after full migration to GPU bridge
 package emulator
 
 import (
+	"bufio"
 	"bytes"
 	"fmt"
 	"image"
 	"io"
 	"log"
+	"os"
 	"os/exec"
 	"strconv"
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
 type H264Encoder struct {
 	cmd       *exec.Cmd
 	stdin     io.WriteCloser
+	stdinBuf  *bufio.Writer
 	stdout    io.ReadCloser
 	width     int
 	height    int
+	fps       int
 	mu        sync.Mutex
 	outputBuf chan []byte
 	closed    bool
 	frameNum  int64
+	busy      int32
 }
 
 func (e *H264Encoder) Output() <-chan []byte {
 	return e.outputBuf
 }
 
-// NewH264Encoder creates a new H264 encoder optimized for ultra-low latency streaming
+func (e *H264Encoder) FPS() int {
+	return e.fps
+}
+
+func (e *H264Encoder) IsBusy() bool {
+	return atomic.LoadInt32(&e.busy) == 1
+}
+
+// NewH264Encoder creates a new H264 encoder optimized for the current environment
+// On GPU instances: Uses NVENC for hardware encoding
+// On cloud VMs without GPU: Uses optimized x264 software encoding
 func NewH264Encoder(width, height int, fps int) (*H264Encoder, error) {
-	// Try NVIDIA NVENC first, fall back to x264 if not available
-	return newNVENCEncoder(width, height, fps)
-	// return enc, nil
+	// Check if GPU is available by checking for /dev/dri or NVIDIA
+	if hasGPU() {
+		log.Println("🎮 GPU detected, using NVENC hardware encoder")
+		enc, err := newNVENCEncoder(width, height, fps)
+		if err == nil {
+			return enc, nil
+		}
+		log.Printf("⚠️ NVENC failed, falling back to x264: %v", err)
+	} else {
+		log.Println("💻 No GPU detected, using optimized x264 software encoder")
+	}
+
+	return newCloudOptimizedX264Encoder(width, height, fps)
+}
+
+// hasGPU checks if GPU acceleration is available
+func hasGPU() bool {
+	// Check for NVIDIA GPU
+	if _, err := os.Stat("/dev/nvidia0"); err == nil {
+		return true
+	}
+	// Check for Intel/AMD GPU (DRI)
+	if _, err := os.Stat("/dev/dri/renderD128"); err == nil {
+		return true
+	}
+	return false
 }
 
 // newNVENCEncoder creates an NVIDIA hardware-accelerated encoder
 func newNVENCEncoder(width, height int, fps int) (*H264Encoder, error) {
-	// Simplified NVIDIA NVENC settings
+
 	cmd := exec.Command("ffmpeg",
+		"-loglevel", "error",
+
+		// INPUT settings
 		"-f", "rawvideo",
 		"-pix_fmt", "rgba",
 		"-s", fmt.Sprintf("%dx%d", width, height),
 		"-r", strconv.Itoa(fps),
 		"-i", "pipe:0",
-		"-an",
+
+		// FIX: CPU convert RGBA -> YUV420P (required)
+		"-vf", "format=yuv420p,hwupload_cuda",
+
+		// NVENC (FULL GPU ENCODER)
 		"-c:v", "h264_nvenc",
-		"-preset", "fast",
-		"-rc", "cbr",
-		"-b:v", "2M",
-		"-maxrate", "2M",
-		"-bufsize", "1M",
-		"-pix_fmt", "yuv420p",
-		"-g", strconv.Itoa(fps*2), // Keyframe every 2 seconds
+		"-preset", "p1", // ultra-fast
+		"-tune", "ull", // ultra-low latency
+		"-rc", "constqp", // maximum GPU usage
+		"-qp", "22", // increase quality by lowering number
+		"-g", strconv.Itoa(fps),
 		"-keyint_min", "1",
-		"-profile:v", "main",
-		"-level", "4.0",
+		"-profile:v", "high",
+		"-level", "5.1",
+
+		// Output
 		"-f", "h264",
 		"-bsf:v", "h264_mp4toannexb",
-		"-flags", "+cgop", // Ensure SPS/PPS are repeated
 		"pipe:1",
 	)
 
-	return setupEncoder(cmd, width, height)
+	return setupEncoder(cmd, width, height, fps)
 }
 
 // newX264Encoder creates a software x264 encoder (fallback)
@@ -93,15 +151,64 @@ func newX264Encoder(width, height int, fps int) (*H264Encoder, error) {
 		"pipe:1",
 	)
 
-	return setupEncoder(cmd, width, height)
+	return setupEncoder(cmd, width, height, fps)
+}
+
+// newCloudOptimizedX264Encoder creates a software x264 encoder optimized for cloud VMs
+// Settings tuned for GCP/AWS instances: lower CPU usage, bitrate limiting, faster encoding
+func newCloudOptimizedX264Encoder(width, height int, fps int) (*H264Encoder, error) {
+	// Limit FPS on cloud to reduce CPU load
+	targetFPS := fps
+	if targetFPS > 20 {
+		targetFPS = 20
+		log.Printf("💡 Limiting FPS to %d for cloud VM optimization", targetFPS)
+	}
+
+	// Use superfast instead of ultrafast - better quality at similar speed
+	// Use higher CRF (lower quality) to reduce encoding CPU
+	// Add bitrate limit to prevent bandwidth spikes
+	cmd := exec.Command("ffmpeg",
+		"-loglevel", "warning",
+		"-f", "rawvideo",
+		"-pix_fmt", "rgba",
+		"-s", fmt.Sprintf("%dx%d", width, height),
+		"-r", strconv.Itoa(targetFPS),
+		"-i", "pipe:0",
+		"-an",
+		// Optimized x264 for cloud
+		"-c:v", "libx264",
+		"-preset", "superfast", // Good balance of speed/quality
+		"-tune", "zerolatency", // Essential for streaming
+		"-crf", "28", // Higher = faster encoding, smaller files
+		"-maxrate", "1500k", // Cap bitrate for consistent streaming
+		"-bufsize", "3000k", // Buffer for rate control
+		"-pix_fmt", "yuv420p",
+		"-g", strconv.Itoa(targetFPS), // Keyframe every second
+		"-keyint_min", "1",
+		"-profile:v", "baseline", // Maximum compatibility
+		"-level", "3.1", // Lower level = faster decode on client
+		"-threads", "4", // Limit threads to not starve other processes
+		"-thread_type", "slice", // Slice-based threading for low latency
+		"-f", "h264",
+		"-bsf:v", "h264_mp4toannexb",
+		"-fflags", "nobuffer", // Minimize buffering
+		"-flags", "low_delay", // Low delay mode
+		"-flush_packets", "1",
+		"pipe:1",
+	)
+
+	return setupEncoder(cmd, width, height, fps)
 }
 
 // setupEncoder initializes the encoder process
-func setupEncoder(cmd *exec.Cmd, width, height int) (*H264Encoder, error) {
+func setupEncoder(cmd *exec.Cmd, width, height, fps int) (*H264Encoder, error) {
 	stdin, err := cmd.StdinPipe()
 	if err != nil {
 		return nil, fmt.Errorf("stdin pipe: %w", err)
 	}
+
+	// Use buffered writer for stdin to prevent broken pipe issues
+	stdinBuf := bufio.NewWriterSize(stdin, 4*1024*1024)
 
 	stdout, err := cmd.StdoutPipe()
 	if err != nil {
@@ -118,7 +225,7 @@ func setupEncoder(cmd *exec.Cmd, width, height int) (*H264Encoder, error) {
 				return
 			}
 			if n > 0 {
-				log.Printf("🎬 FFmpeg: %s", string(buf[:n]))
+				log.Printf(" FFmpeg: %s", string(buf[:n]))
 			}
 		}
 	}()
@@ -130,9 +237,11 @@ func setupEncoder(cmd *exec.Cmd, width, height int) (*H264Encoder, error) {
 	enc := &H264Encoder{
 		cmd:       cmd,
 		stdin:     stdin,
+		stdinBuf:  stdinBuf,
 		stdout:    stdout,
 		width:     width,
 		height:    height,
+		fps:       fps,
 		outputBuf: make(chan []byte, 20), // Small buffer for low latency
 		closed:    false,
 	}
@@ -150,13 +259,13 @@ func (e *H264Encoder) readLoop() {
 	for {
 		n, err := e.stdout.Read(readBuf)
 		if err != nil {
-			log.Printf("🔴 H264 encoder read loop ended: %v (total bytes read: %d)", err, totalBytes)
+			log.Printf(" H264 encoder read loop ended: %v (total bytes read: %d)", err, totalBytes)
 			close(e.outputBuf)
 			return
 		}
 		if n > 0 {
 			totalBytes += n
-			log.Printf("📦 H264 encoder produced %d bytes (total: %d)", n, totalBytes)
+			log.Printf(" H264 encoder produced %d bytes (total: %d)", n, totalBytes)
 
 			// Copy the data since we're reusing the buffer
 			data := make([]byte, n)
@@ -165,10 +274,10 @@ func (e *H264Encoder) readLoop() {
 			// Non-blocking send - drop old frames if buffer is full to keep latency low
 			select {
 			case e.outputBuf <- data:
-				log.Printf("✅ H264 data queued for sending")
+				log.Printf(" H264 data queued for sending")
 			default:
 				// Buffer full - drain oldest and add new
-				log.Printf("⚠️ H264 buffer full, dropping old frame")
+				log.Printf(" H264 buffer full, dropping old frame")
 				select {
 				case <-e.outputBuf:
 				default:
@@ -192,14 +301,26 @@ func (e *H264Encoder) Encode(img image.Image) ([]byte, error) {
 		return nil, fmt.Errorf("encoder is closed")
 	}
 
+	// Set busy flag
+	atomic.StoreInt32(&e.busy, 1)
+	defer atomic.StoreInt32(&e.busy, 0)
+
 	// Convert image.Image → RGBA byte slice
 	rgba, ok := img.(*image.RGBA)
 	if !ok {
 		return nil, fmt.Errorf("image is not RGBA")
 	}
 
-	// Send raw RGBA pixels into ffmpeg
-	_, err := e.stdin.Write(rgba.Pix)
+	// Send raw RGBA pixels into ffmpeg using buffered writer
+	_, err := e.stdinBuf.Write(rgba.Pix)
+	if err != nil {
+		return nil, fmt.Errorf("write to ffmpeg: %w", err)
+	}
+
+	// Flush the buffer to ensure data is sent
+	if err := e.stdinBuf.Flush(); err != nil {
+		return nil, fmt.Errorf("flush to ffmpeg: %w", err)
+	}
 	if err != nil {
 		return nil, fmt.Errorf("write to ffmpeg: %w", err)
 	}

@@ -1,3 +1,17 @@
+// DEPRECATED: frame_stream.go
+// This file contains the old frame streaming logic (GetFrame, StreamScreenshot).
+// These functions are replaced by the GPU bridge architecture (internal/bridge/).
+//
+// The new architecture:
+// - Emulator renders to virtio-gpu framebuffer
+// - ffmpeg inside container captures via kmsgrab/DRM
+// - Hardware encoding via VAAPI/NVENC
+// - H.264 NALs sent directly to WebRTC
+//
+// Go server no longer touches raw frames - only handles WebRTC signaling.
+// This file is kept for backward compatibility and fallback scenarios.
+//
+// TODO: Remove after GPU bridge is fully validated
 package emulator
 
 import (
@@ -5,12 +19,46 @@ import (
 	"fmt"
 	"image"
 	"log"
+	"os"
+	"strconv"
 	"time"
 
 	pb "android_cloud_backend/internal/emulator/proto"
 )
 
+// StreamConfig holds configuration for frame streaming
+type StreamConfig struct {
+	Width  uint32 // Request this width from emulator (0 = native)
+	Height uint32 // Request this height from emulator (0 = native)
+	UseRGB bool   // Use RGB888 instead of RGBA8888 (25% smaller)
+}
+
+// DefaultStreamConfig returns optimized settings for cloud VMs
+func DefaultStreamConfig() *StreamConfig {
+	// Read from environment or use defaults
+	width := uint32(720)   // Lower resolution for cloud
+	height := uint32(1280) // Portrait mode (phone)
+
+	if w := os.Getenv("STREAM_WIDTH"); w != "" {
+		if v, err := strconv.ParseUint(w, 10, 32); err == nil {
+			width = uint32(v)
+		}
+	}
+	if h := os.Getenv("STREAM_HEIGHT"); h != "" {
+		if v, err := strconv.ParseUint(h, 10, 32); err == nil {
+			height = uint32(v)
+		}
+	}
+
+	return &StreamConfig{
+		Width:  width,
+		Height: height,
+		UseRGB: false, // RGBA is needed for proper image.RGBA conversion
+	}
+}
+
 // ensureStream creates or recreates the stream if needed
+// Optimized for GCP/cloud VMs: requests lower resolution to reduce bandwidth
 func (e *EmulatorClient) ensureStream() error {
 	e.streamMu.Lock()
 	defer e.streamMu.Unlock()
@@ -19,16 +67,26 @@ func (e *EmulatorClient) ensureStream() error {
 		return nil // Stream already exists
 	}
 
-	// Create new streaming RPC with raw RGBA8888 format for fastest performance
-	stream, err := e.client.StreamScreenshot(context.Background(), &pb.ImageFormat{
+	// Get optimized stream settings
+	cfg := DefaultStreamConfig()
+
+	// Request RGBA8888 format at reduced resolution for cloud VMs
+	// Lower resolution = less data to transfer = faster encoding
+	format := &pb.ImageFormat{
 		Format: pb.ImageFormat_RGBA8888,
-	})
+		Width:  cfg.Width,  // Request scaled down
+		Height: cfg.Height, // Request scaled down
+	}
+
+	log.Printf("📺 Creating screenshot stream: %dx%d RGBA8888", cfg.Width, cfg.Height)
+
+	stream, err := e.client.StreamScreenshot(context.Background(), format)
 	if err != nil {
 		return fmt.Errorf("failed to create StreamScreenshot: %w", err)
 	}
 
 	e.stream = stream
-	log.Printf("📡 Created new screenshot stream")
+	log.Printf("✅ Screenshot stream created")
 	return nil
 }
 
@@ -38,7 +96,7 @@ func (e *EmulatorClient) closeStream() {
 	defer e.streamMu.Unlock()
 
 	if e.stream != nil {
-		log.Printf("🔌 Closing screenshot stream")
+		log.Printf(" Closing screenshot stream")
 		// Note: gRPC streams don't have explicit Close methods
 		// The stream will be closed when the context is cancelled or connection drops
 		e.stream = nil
@@ -88,7 +146,7 @@ func (e *EmulatorClient) GetFrame() (image.Image, error) {
 		return nil, fmt.Errorf("stream.Recv failed: %w", err)
 	case <-time.After(10 * time.Second):
 		// Timeout - the emulator might be busy, close stream and let next call create new one
-		log.Printf("⏰ Stream recv timeout after 10s - recreating stream")
+		log.Printf(" Stream recv timeout after 10s - recreating stream")
 		e.closeStream()
 		return nil, fmt.Errorf("stream.Recv timeout after 10 seconds")
 	}
@@ -110,7 +168,7 @@ func (e *EmulatorClient) GetFrame() (image.Image, error) {
 
 	// Warn if frame is much larger than expected (possible corruption)
 	if actualSize > expectedSize*2 {
-		log.Printf("⚠️ Frame data larger than expected: expected ~%d bytes, got %d bytes", expectedSize, actualSize)
+		log.Printf(" Frame data larger than expected: expected ~%d bytes, got %d bytes", expectedSize, actualSize)
 	}
 
 	// Create output RGBA image directly from raw bytes (fastest)
@@ -123,6 +181,6 @@ func (e *EmulatorClient) GetFrame() (image.Image, error) {
 	}
 	copy(img.Pix, res.Image[:copySize])
 
-	log.Printf("📺 Received frame: %dx%d (%d bytes)", w, h, actualSize)
+	log.Printf(" Received frame: %dx%d (%d bytes)", w, h, actualSize)
 	return img, nil
 }

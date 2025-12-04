@@ -1,16 +1,19 @@
 package api
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
-	"image"
+	"image" // TODO: Remove after full migration to bridge
 	"io"
 	"log"
 	"net/http"
+	"os"
 	"strconv"
 	"strings"
 	"time"
 
+	"android_cloud_backend/internal/bridge"
 	"android_cloud_backend/internal/config"
 	"android_cloud_backend/internal/container"
 	"android_cloud_backend/internal/emulator"
@@ -36,7 +39,6 @@ func NewHandler(cm *container.Manager, cfg *config.Config) *Handler {
 		config:           cfg,
 	}
 }
-
 
 // HealthCheck handles GET /api/health
 func (h *Handler) HealthCheck(w http.ResponseWriter, r *http.Request) {
@@ -97,7 +99,7 @@ func (h *Handler) CreateContainer(w http.ResponseWriter, r *http.Request) {
 	// Set user_id from context
 	req.UserID = userID
 
-	log.Printf("🆕 Creating container for user %s with image %s", userID, req.ImageID)
+	log.Printf("Creating container for user %s with image %s", userID, req.ImageID)
 
 	ec, err := h.containerManager.CreateContainer(r.Context(), &req)
 	if err != nil {
@@ -113,7 +115,7 @@ func (h *Handler) CreateContainer(w http.ResponseWriter, r *http.Request) {
 	}
 
 	log.Printf("Container created successfully: ID=%s, Name=%s, Status=%s", ec.ID, ec.Name, ec.Status)
-	log.Printf("📊 Container details: StartedAt=%v, CreatedAt=%v, UserID=%s", ec.StartedAt, ec.CreatedAt, ec.UserID)
+	log.Printf("Container details: StartedAt=%v, CreatedAt=%v, UserID=%s", ec.StartedAt, ec.CreatedAt, ec.UserID)
 
 	response := models.CreateContainerResponse{
 		Success:   true,
@@ -276,6 +278,45 @@ func (h *Handler) StopContainer(w http.ResponseWriter, r *http.Request) {
 	json.NewEncoder(w).Encode(response)
 }
 
+// StartContainer handles POST /api/containers/{id}/start
+func (h *Handler) StartContainer(w http.ResponseWriter, r *http.Request) {
+	// Check if container manager is available
+	if h.containerManager == nil {
+		h.sendError(w, http.StatusServiceUnavailable, "Container management is not available (Docker not connected)", "DOCKER_UNAVAILABLE")
+		return
+	}
+
+	// Get user_id from JWT context
+	userID, ok := r.Context().Value("user_id").(string)
+	if !ok || userID == "" {
+		h.sendError(w, http.StatusUnauthorized, "User not authenticated", "UNAUTHENTICATED")
+		return
+	}
+
+	// Extract container ID from URL path
+	containerID := strings.TrimPrefix(r.URL.Path, "/api/containers/")
+	containerID = strings.TrimSuffix(containerID, "/start")
+
+	if containerID == "" {
+		h.sendError(w, http.StatusBadRequest, "Container ID required", "MISSING_CONTAINER_ID")
+		return
+	}
+
+	log.Printf("Starting container: %s for user %s", containerID, userID)
+
+	if err := h.containerManager.StartContainer(r.Context(), containerID); err != nil {
+		log.Printf("Failed to start container: %v", err)
+		h.sendError(w, http.StatusInternalServerError, err.Error(), "START_FAILED")
+		return
+	}
+
+	response := map[string]interface{}{
+		"success": true,
+		"message": "Container started successfully",
+	}
+	json.NewEncoder(w).Encode(response)
+}
+
 // DeleteContainer handles DELETE /api/containers/{id}
 func (h *Handler) DeleteContainer(w http.ResponseWriter, r *http.Request) {
 	// Check if container manager is available
@@ -417,17 +458,28 @@ func (h *Handler) HandleOfferWithContainer(w http.ResponseWriter, r *http.Reques
 	h.handleOffer(w, r, containerID)
 }
 
+// Encoder interface for different video encoders
+type Encoder interface {
+	FPS() int
+	IsBusy() bool
+}
+
 // WebRTC session manager for persistent connections
+// Updated for GPU bridge architecture - Go no longer touches raw frames
 type WebRTCSession struct {
-	peerConnection *webrtc.PeerConnection
-	videoTrack     *webrtc.TrackLocalStaticSample
-	emulatorClient *emulator.EmulatorClient
-	encoder        interface{} // Can be H264Encoder or VP8Encoder
-	codecType      string      // "h264" or "vp8"
-	broadcaster    *emulator.Broadcaster
-	containerID    string
-	grpcPort       int
-	lastActivity   time.Time
+	peerConnection   *webrtc.PeerConnection
+	videoTrack       *webrtc.TrackLocalStaticSample
+	emulatorClient   *emulator.EmulatorClient // Still used for touch/keyboard input
+	encoder          Encoder                  // DEPRECATED: Will be removed after bridge migration
+	codecType        string                   // "h264" or "vp8"
+	broadcaster      *emulator.Broadcaster    // DEPRECATED: Will be removed after bridge migration
+	containerID      string
+	grpcPort         int
+	lastActivity     time.Time
+	containerBridge  *bridge.ContainerBridge // NEW: GPU bridge for streaming
+	BridgeProcessID  string                  // NEW: Docker exec ID for the bridge process
+	containerManager *container.Manager      // NEW: Reference to container manager
+	useGPUBridge     bool                    // NEW: Flag to use GPU bridge instead of old pipeline
 }
 
 type WebRTCSessionManager struct {
@@ -456,7 +508,11 @@ func (sm *WebRTCSessionManager) removeSession(containerID string) {
 		if session.emulatorClient != nil {
 			session.emulatorClient.Close()
 		}
-		// Close encoder if it has a Close method
+		// Stop GPU bridge if running
+		if session.containerBridge != nil {
+			session.containerBridge.Stop()
+		}
+		// Close encoder if it has a Close method (DEPRECATED)
 		if session.encoder != nil {
 			if encoder, ok := session.encoder.(*emulator.H264Encoder); ok {
 				encoder.Close()
@@ -533,9 +589,34 @@ func (h *Handler) handleOffer(w http.ResponseWriter, r *http.Request, containerI
 		return
 	}
 
-	// Create WebRTC peer connection
+	// Get TURN server configuration from environment or use defaults
+	turnServer := os.Getenv("TURN_SERVER")
+	if turnServer == "" {
+		turnServer = "turn:turn.aether.dev:3478" // Default TURN server
+	}
+	turnUser := os.Getenv("TURN_USER")
+	if turnUser == "" {
+		turnUser = "dev"
+	}
+	turnPass := os.Getenv("TURN_PASS")
+	if turnPass == "" {
+		turnPass = "dev123"
+	}
+
+	// Create WebRTC peer connection with TURN server for NAT traversal
+	// TURN is required for cloud instances behind NAT/firewall
 	peerConnection, err := webrtc.NewPeerConnection(webrtc.Configuration{
-		ICEServers: []webrtc.ICEServer{{URLs: []string{"stun:stun.l.google.com:19302"}}},
+		ICEServers: []webrtc.ICEServer{
+			// STUN for direct connectivity check
+			{URLs: []string{"stun:stun.l.google.com:19302"}},
+			// TURN for relay when direct connection fails (essential for GCP)
+			{
+				URLs:       []string{turnServer, strings.Replace(turnServer, "turn:", "turns:", 1) + "?transport=tcp"},
+				Username:   turnUser,
+				Credential: turnPass,
+			},
+		},
+		ICETransportPolicy: webrtc.ICETransportPolicyAll, // Try direct first, then relay
 	})
 	if err != nil {
 		h.sendError(w, http.StatusInternalServerError, "Failed to create peer connection", "WEBRTC_ERROR")
@@ -582,24 +663,36 @@ func (h *Handler) handleOffer(w http.ResponseWriter, r *http.Request, containerI
 		return
 	}
 
-	// Prepare session
+	// Prepare session with GPU bridge support
 	grpcPort := 0
 	if targetContainer != nil {
 		grpcPort = targetContainer.GRPCPort
 	}
 
+	// Check if GPU bridge should be used
+	// Set USE_GPU_BRIDGE=false on cloud instances without GPU (e.g., standard GCP VMs)
+	// Set USE_GPU_BRIDGE=true on GPU instances or WSL2 with GPU passthrough
+	useGPUBridge := os.Getenv("USE_GPU_BRIDGE") != "false"
+	if os.Getenv("USE_GPU_BRIDGE") == "" {
+		// Auto-detect: default to false if no GPU likely available
+		// This helps cloud instances without GPU work out of the box
+		useGPUBridge = true // Tries bridge first, falls back to gRPC if fails
+	}
+
 	session := &WebRTCSession{
-		peerConnection: peerConnection,
-		videoTrack:     videoTrack,
-		containerID:    containerID,
-		grpcPort:       grpcPort,
-		codecType:      "h264",
-		lastActivity:   time.Now(),
+		peerConnection:   peerConnection,
+		videoTrack:       videoTrack,
+		containerID:      containerID,
+		grpcPort:         grpcPort,
+		codecType:        "h264",
+		lastActivity:     time.Now(),
+		containerManager: h.containerManager,
+		useGPUBridge:     useGPUBridge,
 	}
 
 	// Handle data channels (for touch input)
 	peerConnection.OnDataChannel(func(dc *webrtc.DataChannel) {
-		log.Printf("📡 Data channel opened: %s", dc.Label())
+		log.Printf(" Data channel opened: %s", dc.Label())
 
 		dc.OnOpen(func() {
 			log.Printf("Data channel ready: %s", dc.Label())
@@ -611,7 +704,7 @@ func (h *Handler) handleOffer(w http.ResponseWriter, r *http.Request, containerI
 			}
 
 			message := string(msg.Data)
-			log.Printf("📨 Received message on %s: %s", dc.Label(), message)
+			log.Printf(" Received message on %s: %s", dc.Label(), message)
 
 			// Handle touch commands
 			if strings.HasPrefix(message, "touch:") {
@@ -620,10 +713,22 @@ func (h *Handler) handleOffer(w http.ResponseWriter, r *http.Request, containerI
 					x, errX := strconv.Atoi(parts[1])
 					y, errY := strconv.Atoi(parts[2])
 					if errX == nil && errY == nil {
-						log.Printf("👆 Processing touch at (%d, %d) for container %s", x, y, containerID)
-						// TODO: Send touch to emulator via gRPC
+						log.Printf(" Processing touch at (%d, %d) for container %s", x, y, containerID)
 						go session.sendTouchToEmulator(x, y)
 					}
+				}
+			}
+
+			// Handle keyboard commands
+			if strings.HasPrefix(message, "keydown:") || strings.HasPrefix(message, "keyup:") {
+				parts := strings.Split(message, ":")
+				if len(parts) == 3 {
+					eventType := strings.TrimPrefix(parts[0], "key")
+					keyName := parts[1]
+					keyCode := parts[2]
+
+					log.Printf(" Processing keyboard %s: %s (%s) for container %s", eventType, keyName, keyCode, containerID)
+					go session.sendKeyToEmulator(eventType, keyName, keyCode)
 				}
 			}
 		})
@@ -633,7 +738,7 @@ func (h *Handler) handleOffer(w http.ResponseWriter, r *http.Request, containerI
 		})
 	})
 
-	// Connection state callback
+	// Connection state callback - GPU bridge architecture
 	peerConnection.OnConnectionStateChange(func(state webrtc.PeerConnectionState) {
 		log.Printf("WebRTC state for %s: %s", containerID, state.String())
 
@@ -643,7 +748,42 @@ func (h *Handler) handleOffer(w http.ResponseWriter, r *http.Request, containerI
 		}
 
 		if state == webrtc.PeerConnectionStateConnected {
-			if session.grpcPort > 0 {
+			// NEW: Try GPU bridge first (no pixel processing in Go)
+			if session.useGPUBridge && session.containerManager != nil && session.containerID != "" {
+				log.Printf("🚀 Starting GPU bridge for container %s", session.containerID)
+
+				// Start the GPU bridge inside the container
+				go func() {
+					ctx := context.Background()
+
+					// Create container bridge for streaming
+					bridgeCfg := &bridge.ContainerBridgeConfig{
+						ContainerID: session.containerID,
+						DockerHost:  session.containerManager.GetDockerHost(),
+						HTTPClient:  session.containerManager.GetHTTPClient(),
+						FPS:         30,
+						Width:       1280,
+						Height:      720,
+					}
+
+					session.containerBridge = bridge.NewContainerBridge(session.videoTrack, bridgeCfg)
+
+					if err := session.containerBridge.Start(ctx); err != nil {
+						log.Printf("⚠️ GPU bridge failed, falling back to gRPC streaming: %v", err)
+						// Fallback to old method (DEPRECATED)
+						if session.grpcPort > 0 {
+							go session.startStreaming(session.grpcPort)
+						} else {
+							go session.sendTestFrames()
+						}
+						return
+					}
+
+					log.Printf("✅ GPU bridge started for %s - Go is NOT processing pixels", session.containerID)
+				}()
+			} else if session.grpcPort > 0 {
+				// DEPRECATED: Old streaming method (still available as fallback)
+				log.Printf("⚠️ Using legacy gRPC streaming for container %s", containerID)
 				go session.startStreaming(session.grpcPort)
 			} else {
 				go session.sendTestFrames()
@@ -733,8 +873,113 @@ func (s *WebRTCSession) sendTouchToEmulator(x, y int) {
 	}()
 }
 
-// streamEmulatorFrames captures frames from the emulator, encodes them to H.264, and sends them to WebRTC video track
-// WebRTC session methods
+func (s *WebRTCSession) sendKeyToEmulator(eventType, keyName, keyCode string) {
+	if s.grpcPort <= 0 {
+		log.Printf(" Cannot send key - no gRPC port for session %s", s.containerID)
+		return
+	}
+
+	// Create emulator client if needed
+	if s.emulatorClient == nil {
+		addr := fmt.Sprintf("localhost:%d", s.grpcPort)
+		client, err := emulator.NewEmulatorClient(addr)
+		if err != nil {
+			log.Printf(" Failed to create emulator client for key input: %v", err)
+			return
+		}
+		s.emulatorClient = client
+	}
+
+	// Map key names to Android key codes (simplified mapping)
+	keyCodeMap := map[string]int32{
+		"Enter":      66,  // KEYCODE_ENTER
+		"Backspace":  67,  // KEYCODE_DEL
+		"Tab":        61,  // KEYCODE_TAB
+		"ArrowUp":    19,  // KEYCODE_DPAD_UP
+		"ArrowDown":  20,  // KEYCODE_DPAD_DOWN
+		"ArrowLeft":  21,  // KEYCODE_DPAD_LEFT
+		"ArrowRight": 22,  // KEYCODE_DPAD_RIGHT
+		"Escape":     111, // KEYCODE_ESCAPE
+		" ":          62,  // KEYCODE_SPACE
+		"a":          29,  // KEYCODE_A
+		"b":          30,  // KEYCODE_B
+		"c":          31,  // KEYCODE_C
+		"d":          32,  // KEYCODE_D
+		"e":          33,  // KEYCODE_E
+		"f":          34,  // KEYCODE_F
+		"g":          35,  // KEYCODE_G
+		"h":          36,  // KEYCODE_H
+		"i":          37,  // KEYCODE_I
+		"j":          38,  // KEYCODE_J
+		"k":          39,  // KEYCODE_K
+		"l":          40,  // KEYCODE_L
+		"m":          41,  // KEYCODE_M
+		"n":          42,  // KEYCODE_N
+		"o":          43,  // KEYCODE_O
+		"p":          44,  // KEYCODE_P
+		"q":          45,  // KEYCODE_Q
+		"r":          46,  // KEYCODE_R
+		"s":          47,  // KEYCODE_S
+		"t":          48,  // KEYCODE_T
+		"u":          49,  // KEYCODE_U
+		"v":          50,  // KEYCODE_V
+		"w":          51,  // KEYCODE_W
+		"x":          52,  // KEYCODE_X
+		"y":          53,  // KEYCODE_Y
+		"z":          54,  // KEYCODE_Z
+		"0":          7,   // KEYCODE_0
+		"1":          8,   // KEYCODE_1
+		"2":          9,   // KEYCODE_2
+		"3":          10,  // KEYCODE_3
+		"4":          11,  // KEYCODE_4
+		"5":          12,  // KEYCODE_5
+		"6":          13,  // KEYCODE_6
+		"7":          14,  // KEYCODE_7
+		"8":          15,  // KEYCODE_8
+		"9":          16,  // KEYCODE_9
+	}
+
+	androidKeyCode, exists := keyCodeMap[keyName]
+	if !exists {
+		// For unmapped keys, try to use the numeric keyCode if it's a number
+		if code, err := strconv.Atoi(keyCode); err == nil && code > 0 {
+			androidKeyCode = int32(code)
+		} else {
+			log.Printf(" Unmapped key: %s (%s)", keyName, keyCode)
+			return
+		}
+	}
+
+	// Determine event type
+	var eventTypeEnum emulatorpb.KeyboardEvent_KeyEventType
+	if eventType == "down" {
+		eventTypeEnum = emulatorpb.KeyboardEvent_keydown
+	} else {
+		eventTypeEnum = emulatorpb.KeyboardEvent_keyup
+	}
+
+	// Create keyboard event
+	keyEvent := &emulatorpb.KeyboardEvent{
+		CodeType:  emulatorpb.KeyboardEvent_Evdev, // Use Evdev key codes
+		EventType: eventTypeEnum,
+		KeyCode:   androidKeyCode,
+		Key:       keyName,
+	}
+
+	if err := s.emulatorClient.SendKey(keyEvent); err != nil {
+		log.Printf(" Failed to send key %s to emulator %s: %v", eventType, s.containerID, err)
+	} else {
+		log.Printf(" Key %s sent to emulator %s: %s (%d)", eventType, s.containerID, keyName, androidKeyCode)
+	}
+}
+
+// DEPRECATED: startStreaming - Legacy frame streaming method
+// This method is replaced by the GPU bridge architecture.
+// The GPU bridge runs ffmpeg inside the container with hardware encoding (VAAPI/NVENC),
+// eliminating the need for Go to process raw frames.
+//
+// This method is kept for backward compatibility when GPU bridge fails.
+// TODO: Remove after GPU bridge is fully validated
 func (s *WebRTCSession) startStreaming(grpcPort int) {
 	defer func() {
 		if r := recover(); r != nil {
@@ -745,7 +990,7 @@ func (s *WebRTCSession) startStreaming(grpcPort int) {
 	// Store gRPC port
 	s.grpcPort = grpcPort
 	addr := fmt.Sprintf("localhost:%d", grpcPort)
-	log.Printf("🎮 Connecting to emulator at %s for session %s", addr, s.containerID)
+	log.Printf(" Connecting to emulator at %s for session %s", addr, s.containerID)
 
 	// Connect to emulator
 	client, err := emulator.NewEmulatorClient(addr)
@@ -769,8 +1014,8 @@ func (s *WebRTCSession) startStreaming(grpcPort int) {
 	height := firstFrame.Bounds().Dy()
 	log.Printf("Initial frame size: %dx%d for session %s", width, height, s.containerID)
 
-	// Create H.264 encoder (30 FPS)
-	enc, err := emulator.NewH264Encoder(width, height, 30)
+	// Create H.264 encoder (15 FPS) to match emulator
+	enc, err := emulator.NewH264Encoder(width, height, 15)
 	if err != nil {
 		log.Printf("Failed creating H264 encoder: %v", err)
 		sessionManager.removeSession(s.containerID)
@@ -794,7 +1039,7 @@ func (s *WebRTCSession) startStreaming(grpcPort int) {
 	if err != nil {
 		log.Printf("Failed to encode first frame: %v", err)
 	} else if len(nals) > 0 {
-		log.Printf("🎬 Sending first frame (%d NAL units)", len(nals))
+		log.Printf(" Sending first frame (%d NAL units)", len(nals))
 
 		// Try twice (sometimes the first write fails due to ICE not complete)
 		if err := s.broadcaster.SendH264NALs(nals); err != nil {
@@ -816,7 +1061,7 @@ func (s *WebRTCSession) startStreaming(grpcPort int) {
 }
 
 func (s *WebRTCSession) sendTestFrames() {
-	log.Printf("🧪 Sending test frames for session %s", s.containerID)
+	log.Printf(" Sending test frames for session %s", s.containerID)
 
 	// Send test H.264 frames every second
 	ticker := time.NewTicker(1 * time.Second)
@@ -854,27 +1099,42 @@ func (s *WebRTCSession) sendTestFrames() {
 	}
 }
 
+// DEPRECATED: streamingLoop - Legacy frame processing loop
+// This method processes raw frames from the emulator which is inefficient.
+// The GPU bridge architecture handles encoding inside the container.
+// TODO: Remove after GPU bridge is fully validated
 func (s *WebRTCSession) streamingLoop() {
-	log.Printf("Starting streaming loop for session %s at 10 FPS", s.containerID)
+	log.Printf("Starting streaming loop for session %s at %d FPS", s.containerID, s.encoder.FPS())
 
-	ticker := time.NewTicker(33 * time.Millisecond) // 30 FPS
+	ticker := time.NewTicker(time.Second / time.Duration(s.encoder.FPS()))
 	defer ticker.Stop()
 
+	lastFrameTime := time.Now()
 	frameCount := 0
 	consecutiveErrors := 0
 	maxConsecutiveErrors := 20
 
-	encoder, ok := s.encoder.(*emulator.H264Encoder)
-	if !ok {
-		log.Printf("Encoder is not H.264 encoder")
-		return
-	}
+	// Encoder interface already validated
 
 	for range ticker.C {
 		// Stop if session removed
 		if sessionManager.getSession(s.containerID) == nil {
 			log.Printf("Streaming ended for session %s", s.containerID)
 			return
+		}
+
+		// Add frame pacing to prevent sending frames too fast to FFmpeg
+		elapsed := time.Since(lastFrameTime)
+		frameInterval := time.Second / time.Duration(s.encoder.FPS())
+		if elapsed < frameInterval {
+			time.Sleep(frameInterval - elapsed)
+		}
+		lastFrameTime = time.Now()
+
+		// Check encoder backpressure - skip frame if encoder is busy
+		if s.encoder.IsBusy() {
+			log.Printf("Encoder busy, skipping frame %d", frameCount)
+			continue
 		}
 
 		// Pull a new frame from emulator
@@ -894,7 +1154,12 @@ func (s *WebRTCSession) streamingLoop() {
 		consecutiveErrors = 0
 
 		// Encode frame to H.264 NAL units
-		nals, err := encoder.EncodeWithNALs(frame)
+		h264enc, ok := s.encoder.(*emulator.H264Encoder)
+		if !ok {
+			log.Printf("Encoder is not H.264 encoder")
+			continue
+		}
+		nals, err := h264enc.EncodeWithNALs(frame)
 		if err != nil {
 			log.Printf("Failed to encode H.264 frame: %v", err)
 			continue
@@ -913,10 +1178,10 @@ func (s *WebRTCSession) streamingLoop() {
 			}
 
 			if frameCount%50 == 0 { // Log every 5 seconds at 10 FPS
-				log.Printf("📺 Streamed %d frames (%d bytes last) for session %s", frameCount, totalBytes, s.containerID)
+				log.Printf(" Streamed %d frames (%d bytes last) for session %s", frameCount, totalBytes, s.containerID)
 			}
 		} else if nals == nil && frameCount < 10 {
-			log.Printf("⏳ Encoder warming up for frame %d", frameCount)
+			log.Printf(" Encoder warming up for frame %d", frameCount)
 		}
 
 		frameCount++

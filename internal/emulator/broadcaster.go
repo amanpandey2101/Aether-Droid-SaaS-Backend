@@ -30,7 +30,7 @@ func (b *Broadcaster) writeNAL(nal []byte) error {
 	}
 	return b.track.WriteSample(media.Sample{
 		Data:     nal,
-		Duration: time.Second / 30, // 30 FPS
+		Duration: time.Second / 60, // 30 FPS
 	})
 }
 
@@ -40,7 +40,7 @@ func getNALType(nal []byte) int {
 		return -1 // invalid
 	}
 
-	// Find the first byte after the start code
+
 	i := 0
 	for i < len(nal)-4 {
 		// 00 00 01
@@ -68,14 +68,14 @@ func (b *Broadcaster) SendH264NALs(nals [][]byte) error {
 
 		nalType := getNALType(nal)
 		if nalType < 0 {
-			log.Printf("⚠️ Skipping invalid NAL (len=%d)", len(nal))
+			log.Printf(" Skipping invalid NAL (len=%d)", len(nal))
 			continue
 		}
 
 		switch nalType {
 		case 7: // SPS
 			b.sps = append([]byte(nil), nal...)
-			log.Printf("📡 Stored and sending SPS (%d bytes)", len(nal))
+			log.Printf(" Stored and sending SPS (%d bytes)", len(nal))
 			if err := b.writeNAL(nal); err != nil {
 				return err
 			}
@@ -83,7 +83,7 @@ func (b *Broadcaster) SendH264NALs(nals [][]byte) error {
 
 		case 8: // PPS
 			b.pps = append([]byte(nil), nal...)
-			log.Printf("📡 Stored and sending PPS (%d bytes)", len(nal))
+			log.Printf(" Stored and sending PPS (%d bytes)", len(nal))
 			if err := b.writeNAL(nal); err != nil {
 				return err
 			}
@@ -93,7 +93,7 @@ func (b *Broadcaster) SendH264NALs(nals [][]byte) error {
 		// For IDR frames (NAL type 5), always prepend SPS/PPS
 		if nalType == 5 {
 			if b.sps != nil && b.pps != nil {
-				log.Printf("📡 Sending SPS/PPS before IDR")
+				log.Printf(" Sending SPS/PPS before IDR")
 				if err := b.writeNAL(b.sps); err != nil {
 					return err
 				}
@@ -101,13 +101,13 @@ func (b *Broadcaster) SendH264NALs(nals [][]byte) error {
 					return err
 				}
 			} else {
-				log.Printf("⚠️ IDR frame but SPS/PPS not ready yet")
+				log.Printf(" IDR frame but SPS/PPS not ready yet")
 			}
 		}
 
 		// Send the actual frame NAL
 		if err := b.writeNAL(nal); err != nil {
-			log.Printf("❌ writeNAL error: %v", err)
+			log.Printf(" writeNAL error: %v", err)
 			return err
 		}
 	}

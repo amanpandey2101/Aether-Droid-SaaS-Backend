@@ -77,6 +77,8 @@ func (r *Router) handleContainerByID(w http.ResponseWriter, req *http.Request) {
 	switch {
 	case action == "stop" && req.Method == http.MethodPost:
 		r.handler.StopContainer(w, req)
+	case action == "start" && req.Method == http.MethodPost:
+		r.handler.StartContainer(w, req)
 	case action == "connect" && req.Method == http.MethodGet:
 		r.handler.ConnectContainer(w, req, "")
 	case action == "" && req.Method == http.MethodGet:

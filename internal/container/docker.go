@@ -427,7 +427,7 @@ func (m *Manager) CreateContainer(ctx context.Context, req *models.CreateContain
 		log.Printf("⚠️  Image pull warning: %v (may already exist)", err)
 	}
 
-	// Build host config
+	// Build host config with GPU device mappings for hardware-accelerated streaming
 	devices := []map[string]string{}
 
 	// KVM device for hardware acceleration
@@ -436,6 +436,24 @@ func (m *Manager) CreateContainer(ctx context.Context, req *models.CreateContain
 		"PathInContainer":   "/dev/kvm",
 		"CgroupPermissions": "rwm",
 	})
+
+	// DRI devices for virtio-gpu and VAAPI hardware encoding
+	devices = append(devices, map[string]string{
+		"PathOnHost":        "/dev/dri/renderD128",
+		"PathInContainer":   "/dev/dri/renderD128",
+		"CgroupPermissions": "rwm",
+	})
+
+	devices = append(devices, map[string]string{
+		"PathOnHost":        "/dev/dri/card0",
+		"PathInContainer":   "/dev/dri/card0",
+		"CgroupPermissions": "rwm",
+	})
+
+	// Add GPU-related environment variables for virtio-gpu emulator
+	env = append(env, "ANDROID_EMU_GPU=virtio")
+	env = append(env, "ANDROID_EMU_FEATURES=allow-host-graphics")
+	env = append(env, "DISPLAY=:0")
 
 	// Parse memory
 	memory := req.Memory
@@ -451,7 +469,7 @@ func (m *Manager) CreateContainer(ctx context.Context, req *models.CreateContain
 		memoryBytes = val * 1024 * 1024
 	}
 
-	// Create container request body
+	// Create container request body with full GPU support
 	createBody := map[string]interface{}{
 		"Image":        emulatorImage.FullImage,
 		"Env":          env,
@@ -461,8 +479,18 @@ func (m *Manager) CreateContainer(ctx context.Context, req *models.CreateContain
 			"PortBindings": portBindings,
 			"Devices":      devices,
 			"Memory":       memoryBytes,
+			"Privileged":   true,                           // Required for GPU access
+			"CapAdd":       []string{"SYS_ADMIN"},          // Required for kmsgrab
+			"SecurityOpt":  []string{"seccomp=unconfined"}, // Required for GPU access
 			"Tmpfs": map[string]string{
 				"/data": "size=2g",
+			},
+			// NVIDIA GPU support (if available)
+			"DeviceRequests": []map[string]interface{}{
+				{
+					"Count":        -1, // All GPUs
+					"Capabilities": [][]string{{"gpu"}},
+				},
 			},
 		},
 	}
@@ -637,6 +665,42 @@ func (m *Manager) StopContainer(ctx context.Context, containerID string, timeout
 	return nil
 }
 
+func (m *Manager) StartContainer(ctx context.Context, containerID string) error {
+	m.mu.Lock()
+	if ec, exists := m.containers[containerID]; exists {
+		ec.Status = models.StatusStarting
+	}
+	m.mu.Unlock()
+
+	log.Printf("▶️  Starting container: %s", containerID[:12])
+
+	resp, err := m.doRequest(ctx, "POST", fmt.Sprintf("/v1.44/containers/%s/start", containerID), nil)
+	if err != nil {
+		return fmt.Errorf("failed to start container: %w", err)
+	}
+	resp.Body.Close()
+
+	if resp.StatusCode != http.StatusNoContent && resp.StatusCode != http.StatusNotModified {
+		return fmt.Errorf("failed to start container: %s", resp.Status)
+	}
+
+	m.mu.Lock()
+	if ec, exists := m.containers[containerID]; exists {
+		ec.Status = models.StatusRunning
+	}
+	m.mu.Unlock()
+
+	// Update database (if available)
+	if m.database != nil {
+		if err := m.database.UpdateContainerStatus(ctx, containerID, models.StatusRunning, nil); err != nil {
+			log.Printf("⚠️  Failed to update container status in database: %v", err)
+		}
+	}
+
+	log.Printf("✅ Container started: %s", containerID[:12])
+	return nil
+}
+
 // deleteContainer removes a container (internal use)
 func (m *Manager) deleteContainer(ctx context.Context, containerID string, force bool) error {
 	forceParam := ""
@@ -765,6 +829,100 @@ func (m *Manager) GetContainerAddress(ctx context.Context, containerID string) (
 	}
 
 	return fmt.Sprintf("localhost:%d", ec.GRPCPort), nil
+}
+
+// StartBridge starts the GPU streaming bridge inside a container
+// This executes ffmpeg with hardware encoding inside the container and streams to WebRTC
+func (m *Manager) StartBridge(ctx context.Context, containerID string, fps int) error {
+	// Verify container exists and is running
+	ec, err := m.GetContainer(ctx, containerID)
+	if err != nil {
+		return fmt.Errorf("container not found: %w", err)
+	}
+
+	if ec.Status != models.StatusRunning {
+		return fmt.Errorf("container not running: %s", ec.Status)
+	}
+
+	log.Printf("🎬 Starting GPU bridge for container %s", containerID[:12])
+
+	// Build ffmpeg command for VAAPI hardware encoding
+	// Falls back to software encoding if VAAPI is not available
+	ffmpegCmd := []string{
+		"sh", "-c",
+		fmt.Sprintf(`
+			# Try VAAPI first (Intel/AMD GPU)
+			if [ -c /dev/dri/renderD128 ]; then
+				ffmpeg -loglevel warning \
+					-hwaccel vaapi -hwaccel_device /dev/dri/renderD128 -hwaccel_output_format vaapi \
+					-f kmsgrab -framerate %d -i - \
+					-vf 'hwmap,scale_vaapi=w=1280:h=720:format=nv12' \
+					-c:v h264_vaapi -profile:v high -level 4.1 \
+					-g %d -keyint_min %d -bf 0 -qp 23 \
+					-f h264 -bsf:v h264_mp4toannexb pipe:1
+			else
+				# Fallback to software encoding
+				ffmpeg -loglevel warning \
+					-f x11grab -framerate %d -video_size 1280x720 -i :0 \
+					-c:v libx264 -preset ultrafast -tune zerolatency \
+					-crf 23 -pix_fmt yuv420p \
+					-g %d -keyint_min 1 -profile:v baseline -level 4.2 \
+					-f h264 -bsf:v h264_mp4toannexb pipe:1
+			fi
+		`, fps, fps, fps, fps, fps),
+	}
+
+	// Create exec instance
+	execCreateReq := map[string]interface{}{
+		"AttachStdout": true,
+		"AttachStderr": true,
+		"Tty":          false,
+		"Cmd":          ffmpegCmd,
+	}
+
+	resp, err := m.doRequest(ctx, "POST", fmt.Sprintf("/v1.44/containers/%s/exec", containerID), execCreateReq)
+	if err != nil {
+		return fmt.Errorf("failed to create bridge exec: %w", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusCreated {
+		body, _ := io.ReadAll(resp.Body)
+		return fmt.Errorf("exec create failed: %s - %s", resp.Status, string(body))
+	}
+
+	var execResp struct {
+		ID string `json:"Id"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&execResp); err != nil {
+		return fmt.Errorf("failed to parse exec response: %w", err)
+	}
+
+	// Start the exec
+	execStartReq := map[string]interface{}{
+		"Detach": true, // Run in background
+		"Tty":    false,
+	}
+
+	startResp, err := m.doRequest(ctx, "POST", fmt.Sprintf("/v1.44/exec/%s/start", execResp.ID), execStartReq)
+	if err != nil {
+		return fmt.Errorf("failed to start bridge exec: %w", err)
+	}
+	startResp.Body.Close()
+
+	log.Printf("✅ GPU bridge started for container %s (exec: %s)", containerID[:12], execResp.ID[:12])
+
+	return nil
+}
+
+// GetDockerHost returns the Docker API host URL
+func (m *Manager) GetDockerHost() string {
+	return m.dockerHost
+}
+
+// GetHTTPClient returns the HTTP client for Docker API
+func (m *Manager) GetHTTPClient() *http.Client {
+	return m.httpClient
 }
 
 // Close cleans up the manager
