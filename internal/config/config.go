@@ -73,8 +73,8 @@ func DefaultConfig() *Config {
 			DefaultGRPCPort: getEnvInt("EMULATOR_GRPC_PORT", 8554),
 			DefaultADBPort:  getEnvInt("EMULATOR_ADB_PORT", 5555),
 			ADBKeyPath:      getEnv("ADB_KEY_PATH", expandHome("~/.android/adbkey")),
-			DefaultMemory:   getEnv("EMULATOR_MEMORY", "4g"),
-			DefaultCPUs:     getEnvInt("EMULATOR_CPUS", 2),
+			DefaultMemory:   getEnv("EMULATOR_MEMORY", "8g"),
+			DefaultCPUs:     getEnvInt("EMULATOR_CPUS", 3),
 		},
 		WebRTC: WebRTCConfig{
 			MinPort: getEnvInt("WEBRTC_MIN_PORT", 50000),

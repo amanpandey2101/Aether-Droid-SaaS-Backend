@@ -350,7 +350,7 @@ func startFrameLoop() {
 		}
 
 		if len(h264Data) == 0 {
-			continue // Encoder still processing
+			continue 
 		}
 		nals := emulator.ParseNALUnits(h264Data)
 		// Send frame

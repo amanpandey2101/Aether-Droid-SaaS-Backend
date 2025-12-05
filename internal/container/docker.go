@@ -130,21 +130,17 @@ type dockerPortBinding struct {
 	HostPort string `json:"HostPort"`
 }
 
-// NewManager creates a new container manager
+
 func NewManager(cfg *config.Config, db *database.Service) (*Manager, error) {
-	// Create HTTP client for Docker socket communication
-	// On Linux/macOS: unix:///var/run/docker.sock
-	// On Windows: npipe:////./pipe/docker_engine
 
 	dockerHost := cfg.Docker.Host
 	if dockerHost == "" {
-		// Auto-detect based on OS with fallback options
 		if _, err := os.Stat("/var/run/docker.sock"); err == nil {
 			// Linux/macOS: Unix socket
 			dockerHost = "unix:///var/run/docker.sock"
 		} else {
-			// Windows: Try multiple connection methods
-			dockerHost = "tcp://localhost:2375" // Default to TCP (needs to be enabled in Docker Desktop)
+	
+			dockerHost = "tcp://localhost:2375" 
 		}
 	}
 
@@ -164,7 +160,7 @@ func NewManager(cfg *config.Config, db *database.Service) (*Manager, error) {
 		apiHost = "http://localhost"
 	} else if strings.HasPrefix(dockerHost, "npipe://") {
 		// Windows named pipe - not implemented yet
-		log.Printf("⚠️  Named pipe connection not implemented, trying TCP fallback...")
+		log.Printf("Named pipe connection not implemented, trying TCP fallback...")
 		httpClient = &http.Client{Timeout: 30 * time.Second}
 		apiHost = "http://localhost:2375"
 	} else if strings.HasPrefix(dockerHost, "tcp://") {
@@ -175,8 +171,8 @@ func NewManager(cfg *config.Config, db *database.Service) (*Manager, error) {
 		apiHost = dockerHost
 	}
 
-	log.Printf("🔌 Attempting to connect to Docker at: %s", dockerHost)
-	log.Printf("💡 If connection fails, run: .\\enable_docker_tcp.ps1")
+	log.Printf("Attempting to connect to Docker at: %s", dockerHost)
+	log.Printf("If connection fails, run: .\\enable_docker_tcp.ps1")
 
 	manager := &Manager{
 		httpClient:    httpClient,
@@ -195,11 +191,11 @@ func NewManager(cfg *config.Config, db *database.Service) (*Manager, error) {
 		return nil, fmt.Errorf("failed to connect to Docker: %w", err)
 	}
 
-	log.Println("✅ Connected to Docker daemon")
+	log.Println("Connected to Docker daemon")
 
 	// Load existing containers
 	if err := manager.syncContainers(context.Background()); err != nil {
-		log.Printf("⚠️  Warning: Failed to sync existing containers: %v", err)
+		log.Printf("Warning: Failed to sync existing containers: %v", err)
 	}
 
 	return manager, nil
@@ -247,7 +243,7 @@ func (m *Manager) doRequest(ctx context.Context, method, path string, body inter
 	return m.httpClient.Do(req)
 }
 
-// syncContainers loads existing Aether containers from Docker
+
 func (m *Manager) syncContainers(ctx context.Context) error {
 	resp, err := m.doRequest(ctx, "GET", "/v1.44/containers/json?all=true&filters=%7B%22label%22%3A%5B%22app%3Daether-droid%22%5D%7D", nil)
 	if err != nil {
@@ -284,11 +280,11 @@ func (m *Manager) syncContainers(ctx context.Context) error {
 			m.portAllocator.mu.Unlock()
 		}
 
-		log.Printf("📦 Found existing container: %s (%s) - gRPC:%d, ADB:%d",
+		log.Printf("Found existing container: %s (%s) - gRPC:%d, ADB:%d",
 			ec.Name, ec.Status, ec.GRPCPort, ec.ADBPort)
 	}
 
-	log.Printf("📊 Synced %d existing containers", len(containers))
+	log.Printf("Synced %d existing containers", len(containers))
 	return nil
 }
 
@@ -349,13 +345,12 @@ func (m *Manager) dockerToEmulatorContainer(c *dockerContainer) *models.Emulator
 
 // CreateContainer creates and starts a new Android emulator container
 func (m *Manager) CreateContainer(ctx context.Context, req *models.CreateContainerRequest) (*models.EmulatorContainer, error) {
-	// Get the image details
+
 	emulatorImage := GetImageByID(m.config.Docker.Registry, req.ImageID)
 	if emulatorImage == nil {
 		return nil, fmt.Errorf("unknown image ID: %s", req.ImageID)
 	}
 
-	// Allocate ports
 	grpcPort, err := m.portAllocator.Allocate()
 	if err != nil {
 		return nil, fmt.Errorf("failed to allocate gRPC port: %w", err)
@@ -370,13 +365,13 @@ func (m *Manager) CreateContainer(ctx context.Context, req *models.CreateContain
 		}
 	}
 
-	// Generate container name
+
 	containerName := req.Name
 	if containerName == "" {
 		containerName = fmt.Sprintf("aether-emu-%s-%d", req.UserID, time.Now().Unix())
 	}
 
-	// Read ADB key if available
+
 	adbKey := ""
 	if keyData, err := os.ReadFile(m.config.Emulator.ADBKeyPath); err == nil {
 		adbKey = string(keyData)
@@ -401,7 +396,7 @@ func (m *Manager) CreateContainer(ctx context.Context, req *models.CreateContain
 		portBindings["5555/tcp"] = []map[string]string{{"HostPort": strconv.Itoa(adbPort)}}
 	}
 
-	// Build labels
+
 	labels := map[string]string{
 		"app":               "aether-droid",
 		"managed-by":        "aether-backend",
@@ -422,12 +417,12 @@ func (m *Manager) CreateContainer(ctx context.Context, req *models.CreateContain
 	}
 
 	// Pull image if needed
-	log.Printf("📥 Checking image: %s", emulatorImage.FullImage)
+	log.Printf("Checking image: %s", emulatorImage.FullImage)
 	if err := m.pullImage(ctx, emulatorImage.FullImage); err != nil {
-		log.Printf("⚠️  Image pull warning: %v (may already exist)", err)
+		log.Printf("Image pull warning: %v (may already exist)", err)
 	}
 
-	// Build host config with GPU device mappings for hardware-accelerated streaming
+	
 	devices := []map[string]string{}
 
 	// KVM device for hardware acceleration
@@ -469,7 +464,7 @@ func (m *Manager) CreateContainer(ctx context.Context, req *models.CreateContain
 		memoryBytes = val * 1024 * 1024
 	}
 
-	// Create container request body with full GPU support
+
 	createBody := map[string]interface{}{
 		"Image":        emulatorImage.FullImage,
 		"Env":          env,
@@ -485,13 +480,7 @@ func (m *Manager) CreateContainer(ctx context.Context, req *models.CreateContain
 			"Tmpfs": map[string]string{
 				"/data": "size=2g",
 			},
-			// NVIDIA GPU support (if available)
-			"DeviceRequests": []map[string]interface{}{
-				{
-					"Count":        -1, // All GPUs
-					"Capabilities": [][]string{{"gpu"}},
-				},
-			},
+		
 		},
 	}
 
@@ -603,7 +592,7 @@ func (m *Manager) pullImage(ctx context.Context, imageName string) error {
 	return nil
 }
 
-// inspectContainer gets detailed container information
+
 func (m *Manager) inspectContainer(ctx context.Context, containerID string) (*dockerInspectResponse, error) {
 	resp, err := m.doRequest(ctx, "GET", fmt.Sprintf("/v1.44/containers/%s/json", containerID), nil)
 	if err != nil {
@@ -636,7 +625,7 @@ func (m *Manager) StopContainer(ctx context.Context, containerID string, timeout
 		timeout = 10
 	}
 
-	log.Printf("⏹️  Stopping container: %s", containerID[:12])
+	log.Printf("Stopping container: %s", containerID[:12])
 
 	resp, err := m.doRequest(ctx, "POST", fmt.Sprintf("/v1.44/containers/%s/stop?t=%d", containerID, timeout), nil)
 	if err != nil {
@@ -657,11 +646,11 @@ func (m *Manager) StopContainer(ctx context.Context, containerID string, timeout
 	// Update database (if available)
 	if m.database != nil {
 		if err := m.database.UpdateContainerStatus(ctx, containerID, models.StatusStopped, nil); err != nil {
-			log.Printf("⚠️  Failed to update container status in database: %v", err)
+			log.Printf("Failed to update container status in database: %v", err)
 		}
 	}
 
-	log.Printf("✅ Container stopped: %s", containerID[:12])
+	log.Printf("Container stopped: %s", containerID[:12])
 	return nil
 }
 
@@ -672,7 +661,7 @@ func (m *Manager) StartContainer(ctx context.Context, containerID string) error 
 	}
 	m.mu.Unlock()
 
-	log.Printf("▶️  Starting container: %s", containerID[:12])
+	log.Printf("Starting container: %s", containerID[:12])
 
 	resp, err := m.doRequest(ctx, "POST", fmt.Sprintf("/v1.44/containers/%s/start", containerID), nil)
 	if err != nil {
@@ -693,11 +682,11 @@ func (m *Manager) StartContainer(ctx context.Context, containerID string) error 
 	// Update database (if available)
 	if m.database != nil {
 		if err := m.database.UpdateContainerStatus(ctx, containerID, models.StatusRunning, nil); err != nil {
-			log.Printf("⚠️  Failed to update container status in database: %v", err)
+			log.Printf("Failed to update container status in database: %v", err)
 		}
 	}
 
-	log.Printf("✅ Container started: %s", containerID[:12])
+	log.Printf("Container started: %s", containerID[:12])
 	return nil
 }
 
@@ -716,7 +705,7 @@ func (m *Manager) deleteContainer(ctx context.Context, containerID string, force
 	return nil
 }
 
-// DeleteContainer removes a container (public API)
+	// DeleteContainer removes a container (public API)
 func (m *Manager) DeleteContainer(ctx context.Context, containerID string, force bool) error {
 	m.mu.Lock()
 	ec, exists := m.containers[containerID]
@@ -725,7 +714,7 @@ func (m *Manager) DeleteContainer(ctx context.Context, containerID string, force
 	}
 	m.mu.Unlock()
 
-	log.Printf("🗑️  Removing container: %s (force: %v)", containerID[:12], force)
+	log.Printf(" Removing container: %s (force: %v)", containerID[:12], force)
 
 	// Release ports
 	m.mu.RLock()
@@ -747,14 +736,14 @@ func (m *Manager) DeleteContainer(ctx context.Context, containerID string, force
 	delete(m.containers, containerID)
 	m.mu.Unlock()
 
-	// Remove from database (if available)
+	// Remove from database
 	if m.database != nil {
 		if err := m.database.DeleteContainer(ctx, containerID); err != nil {
-			log.Printf("⚠️  Failed to remove container from database: %v", err)
+			log.Printf(" Failed to remove container from database: %v", err)
 		}
 	}
 
-	log.Printf("✅ Container removed: %s", containerID[:12])
+	log.Printf("Container removed: %s", containerID[:12])
 	return nil
 }
 
@@ -768,8 +757,8 @@ func (m *Manager) GetContainer(ctx context.Context, containerID string) (*models
 	if exists {
 		return ec, nil
 	}
-
-	// Try to get from database (if available)
+	
+	// Try to get from database
 	if m.database != nil {
 		ec, err := m.database.GetContainer(ctx, containerID)
 		if err != nil {
@@ -785,7 +774,7 @@ func (m *Manager) GetContainer(ctx context.Context, containerID string) (*models
 func (m *Manager) ListContainers(ctx context.Context, userID string, statusFilter string) ([]*models.EmulatorContainer, error) {
 	var containers []*models.EmulatorContainer
 
-	// Get containers from database (if available)
+	// Get containers from database
 	if m.database != nil {
 		var err error
 		containers, err = m.database.GetUserContainers(ctx, userID)

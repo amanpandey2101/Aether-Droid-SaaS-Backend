@@ -325,6 +325,11 @@ func (e *H264Encoder) Encode(img image.Image) ([]byte, error) {
 		return nil, fmt.Errorf("write to ffmpeg: %w", err)
 	}
 
+	// Flush the buffer to ensure data is sent
+	if err := e.stdinBuf.Flush(); err != nil {
+		return nil, fmt.Errorf("flush to ffmpeg: %w", err)
+	}
+
 	e.frameNum++
 
 	// Read available H.264 data - use longer timeout for encoder warmup
@@ -347,6 +352,49 @@ func (e *H264Encoder) Encode(img image.Image) ([]byte, error) {
 	}
 }
 
+// EncodeRaw sends raw RGBA bytes to ffmpeg
+func (e *H264Encoder) EncodeRaw(data []byte) ([]byte, error) {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+
+	if e.closed {
+		return nil, fmt.Errorf("encoder is closed")
+	}
+
+	// Set busy flag
+	atomic.StoreInt32(&e.busy, 1)
+	defer atomic.StoreInt32(&e.busy, 0)
+
+	// Send raw RGBA pixels into ffmpeg using buffered writer
+	_, err := e.stdinBuf.Write(data)
+	if err != nil {
+		return nil, fmt.Errorf("write to ffmpeg: %w", err)
+	}
+
+	// Flush the buffer to ensure data is sent
+	if err := e.stdinBuf.Flush(); err != nil {
+		return nil, fmt.Errorf("flush to ffmpeg: %w", err)
+	}
+
+	e.frameNum++
+
+	// Read available H.264 data
+	timeout := 100 * time.Millisecond
+	if e.frameNum < 10 {
+		timeout = 500 * time.Millisecond
+	}
+
+	select {
+	case out, ok := <-e.outputBuf:
+		if !ok {
+			return nil, fmt.Errorf("encoder output closed")
+		}
+		return out, nil
+	case <-time.After(timeout):
+		return nil, nil
+	}
+}
+
 // EncodeWithNALs sends a frame and returns parsed NAL units
 func (e *H264Encoder) EncodeWithNALs(img image.Image) ([][]byte, error) {
 	data, err := e.Encode(img)
@@ -357,6 +405,18 @@ func (e *H264Encoder) EncodeWithNALs(img image.Image) ([][]byte, error) {
 		return nil, nil
 	}
 	return ParseNALUnits(data), nil
+}
+
+// EncodeRawWithNALs sends raw bytes and returns parsed NAL units
+func (e *H264Encoder) EncodeRawWithNALs(data []byte) ([][]byte, error) {
+	encoded, err := e.EncodeRaw(data)
+	if err != nil {
+		return nil, err
+	}
+	if encoded == nil {
+		return nil, nil
+	}
+	return ParseNALUnits(encoded), nil
 }
 
 // ParseNALUnits splits H.264 Annex B stream into individual NAL units

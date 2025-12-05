@@ -36,8 +36,9 @@ type StreamConfig struct {
 // DefaultStreamConfig returns optimized settings for cloud VMs
 func DefaultStreamConfig() *StreamConfig {
 	// Read from environment or use defaults
-	width := uint32(720)   // Lower resolution for cloud
-	height := uint32(1280) // Portrait mode (phone)
+	// 360p for ultra-fast software encoding on cloud VMs
+	width := uint32(360)  // 360p width
+	height := uint32(640) // Portrait mode
 
 	if w := os.Getenv("STREAM_WIDTH"); w != "" {
 		if v, err := strconv.ParseUint(w, 10, 32); err == nil {
@@ -104,51 +105,24 @@ func (e *EmulatorClient) closeStream() {
 }
 
 func (e *EmulatorClient) GetFrame() (image.Image, error) {
-	// Ensure we have an active stream
-	if err := e.ensureStream(); err != nil {
-		return nil, fmt.Errorf("ensureStream failed: %w", err)
+	// Get optimized stream settings
+	cfg := DefaultStreamConfig()
+
+	// Use GetScreenshot (polling) instead of StreamScreenshot
+	// This actively requests a frame instead of waiting for screen changes
+	format := &pb.ImageFormat{
+		Format: pb.ImageFormat_RGBA8888,
+		Width:  cfg.Width,
+		Height: cfg.Height,
 	}
 
-	e.streamMu.Lock()
-	stream := e.stream
-	e.streamMu.Unlock()
+	// Call GetScreenshot with timeout
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
 
-	if stream == nil {
-		return nil, fmt.Errorf("stream is nil after ensure")
-	}
-
-	// Log stream receive attempt (every 2 seconds to avoid spam)
-	// This will help debug if GetFrame is hanging
-	defer func() {
-		// This will run when GetFrame returns, helping us see if it hangs
-	}()
-
-	// Receive ONE frame from the persistent stream with timeout
-	frameCh := make(chan *pb.Image, 1)
-	errCh := make(chan error, 1)
-
-	go func() {
-		res, err := stream.Recv()
-		if err != nil {
-			errCh <- err
-			return
-		}
-		frameCh <- res
-	}()
-
-	var res *pb.Image
-	select {
-	case res = <-frameCh:
-		// Frame received successfully
-	case err := <-errCh:
-		// If stream fails, close it so next call will create a new one
-		e.closeStream()
-		return nil, fmt.Errorf("stream.Recv failed: %w", err)
-	case <-time.After(10 * time.Second):
-		// Timeout - the emulator might be busy, close stream and let next call create new one
-		log.Printf(" Stream recv timeout after 10s - recreating stream")
-		e.closeStream()
-		return nil, fmt.Errorf("stream.Recv timeout after 10 seconds")
+	res, err := e.client.GetScreenshot(ctx, format)
+	if err != nil {
+		return nil, fmt.Errorf("GetScreenshot failed: %w", err)
 	}
 
 	w := int(res.Format.Width)
@@ -158,29 +132,41 @@ func (e *EmulatorClient) GetFrame() (image.Image, error) {
 		return nil, fmt.Errorf("invalid resolution: %dx%d", w, h)
 	}
 
-	// Validate frame data size (should be width * height * 4 for RGBA8888)
+	// Validate frame data size
 	expectedSize := w * h * 4
 	actualSize := len(res.Image)
 
 	if actualSize < expectedSize {
-		return nil, fmt.Errorf("frame data too small: expected %d bytes, got %d", expectedSize, actualSize)
+		return nil, fmt.Errorf("frame data too small: expected %d, got %d", expectedSize, actualSize)
 	}
 
-	// Warn if frame is much larger than expected (possible corruption)
-	if actualSize > expectedSize*2 {
-		log.Printf(" Frame data larger than expected: expected ~%d bytes, got %d bytes", expectedSize, actualSize)
-	}
-
-	// Create output RGBA image directly from raw bytes (fastest)
+	// Create output RGBA image directly from raw bytes
 	img := image.NewRGBA(image.Rect(0, 0, w, h))
+	copy(img.Pix, res.Image[:expectedSize])
 
-	// Only copy the expected amount of data to prevent buffer overflows
-	copySize := expectedSize
-	if actualSize < copySize {
-		copySize = actualSize
-	}
-	copy(img.Pix, res.Image[:copySize])
-
-	log.Printf(" Received frame: %dx%d (%d bytes)", w, h, actualSize)
 	return img, nil
+}
+
+// GetRawFrame returns the raw frame bytes without creating an image object
+// This avoids memory allocation and copying overhead
+func (e *EmulatorClient) GetRawFrame() ([]byte, int, int, error) {
+	cfg := DefaultStreamConfig()
+	format := &pb.ImageFormat{
+		Format: pb.ImageFormat_RGBA8888,
+		Width:  cfg.Width,
+		Height: cfg.Height,
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 500*time.Millisecond)
+	defer cancel()
+
+	res, err := e.client.GetScreenshot(ctx, format)
+	if err != nil {
+		return nil, 0, 0, fmt.Errorf("GetScreenshot failed: %w", err)
+	}
+
+	w := int(res.Format.Width)
+	h := int(res.Format.Height)
+
+	return res.Image, w, h, nil
 }
